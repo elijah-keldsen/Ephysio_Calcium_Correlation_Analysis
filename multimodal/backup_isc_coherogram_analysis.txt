@@ -1,0 +1,1373 @@
+"""
+Population-Level Coherence Analysis - Master Script with Bootstrap Methodology
+===============================================================================
+This script implements mathematically rigorous population-level coherence analysis
+using bootstrap methodology for coherogram visualization and ROI-based statistical 
+testing with Wilcoxon test.
+
+Methodology:
+- Bootstrap Approach: Population coherogram difference visualization with 95% CI
+- ROI Statistical Inference: Paired Wilcoxon test on mean coherence values
+- Adaptive texture replacement for high-frequency visualization artifact correction
+"""
+
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import numpy as np
+import xarray as xr
+from xrscipy.signal.spectral import coherogram
+from scipy.signal import coherence
+from scipy.stats import wilcoxon
+from scipy.interpolate import interp1d
+import pandas as pd
+import os
+from typing import Dict, List, Tuple, Optional
+import warnings
+
+# Suppress specific warnings for cleaner output
+warnings.filterwarnings('ignore', category=RuntimeWarning)
+
+
+# ============================================================================
+# EXPERIMENTAL METADATA
+# ============================================================================
+
+# Drug groups with their subject line numbers
+data = {
+    "dexmedetomidine: 0.00045": [46, 47, 64, 88, 97, 101],
+    "dexmedetomidine: 0.0003": [40, 41, 48, 87, 93, 94],
+    "propofol": [36, 43, 44, 86, 99, 103],
+    "sleep": [35, 37, 38, 83, 90, 92],
+    "ketamine": [39, 42, 45, 85, 96, 112]
+}
+
+# Time range mapping for each line number (in minutes)
+selections = { 
+    46:  [[1,20], [28.24, 75]], 
+    47:  [[1,20], [28.24, 75]],  
+    64:  [[4,17], [28.24, 75]], 
+    88:  [[1,8], [28.24, 83.24]],
+    97:  [[1,13], [28.24, 83.24]], 
+    101:  [[1,25], [37, 90]],
+    
+    40:  [[8,20], [55, 75]], 
+    41:  [[10,19], [60, 68]],
+    48:  [[1,20], [25, 35]],
+    87:  [[5,13], [73, 85]],
+    93:  [[18,28], [75, 95]],
+    94:  [[1,20], [75, 90]], 
+    
+    36:  [[1,11], [55, 67]],
+    43:  [[15, 20], [40, 60]], 
+    44:  [[0,21], [40, 65]],
+    86:  [[5,16], [33, 65]],
+    99:  [[0,19], [33, 45]],
+    103:  [[1,17], [38, 65]], 
+    
+    35:  [[1,20], [28.24, 83.24]], 
+    37:  [[1,20], [28.24, 83.24]], 
+    38:  [[1,20], [28.24, 83.24]],
+    83:  [[1,20], [28.24, 83.24]],
+    90:  [[1,20], [28.24, 83.24]], 
+    92:  [[1,20], [28.24, 83.24]], 
+    
+    39:  [[10,20], [38, 50]], 
+    42:  [[1,20], [40, 51]], 
+    45:  [[1,15], [40, 60]], 
+    85:  [[14,24], [30, 50]], 
+    96:  [[1,12], [38, 55]],
+    112:  [[1,10], [40, 60]]
+}
+
+# Create reverse mapping
+number_to_drug = {num: drug for drug, numbers in data.items() for num in numbers}
+
+# Configuration
+CHANNEL_NAME = 'PFCLFPvsCBEEG'  # Change to 'PFCLFPvsCBEEG' or 'PFCEEGvsCBEEG' or 'CBvsPCEEG'
+BASE_DATA_PATH = r"C:\Users\ericm\Desktop\meanFluorescence"
+RESULTS_PATH = r"C:\Users\ericm\Desktop\Correlation_poster\Population_Coherence_Results\PFCLFPvsCBEEG"
+FREQUENCY_ROI = (0.5, 4.0)  # Hz
+FILTER_RANGE = [0.5, 4.0]  # Hz
+
+
+# ============================================================================
+# DATA LOADING FUNCTIONS
+# ============================================================================
+
+def load_experiment(line_num: int, calcium_signal_filepath: str = None, channel: str = CHANNEL_NAME):
+    """
+    Load experiment data using existing data management system.
+    
+    Parameters:
+    -----------
+    line_num : int
+        Subject line number
+    calcium_signal_filepath : str, optional
+        Path to calcium signal file
+    channel : str
+        Channel name
+        
+    Returns:
+    --------
+    channel_object : object
+        Ephys channel object with signal data
+    miniscope_data_manager : object
+        Miniscope data manager with calcium signal
+    fr : float
+        Frame rate
+    """
+    from src2.miniscope.miniscope_data_manager import MiniscopeDataManager
+    from src2.ephys.ephys_api import EphysAPI
+    from src2.multimodal.miniscope_ephys_alignment_utils import (
+        sync_neuralynx_miniscope_timestamps, 
+        find_ephys_idx_of_TTL_events
+    )
+    
+    print(f'  Loading data for subject {line_num}...')
+    
+    # Load miniscope data
+    miniscope_data_manager = MiniscopeDataManager(
+        line_num=line_num, 
+        filenames=[], 
+        auto_import_data=False
+    )
+    metadata = miniscope_data_manager._get_miniscope_metadata()
+    if metadata:
+        miniscope_data_manager.metadata.update(metadata)
+        fr = miniscope_data_manager.metadata['frameRate']
+    else:
+        fr = 30  # Default frame rate
+    
+    # Load ephys data
+    ephys_api = EphysAPI()
+    ephys_api.run(
+        line_num, 
+        channel_name=channel, 
+        remove_artifacts=False, 
+        filter_type=None,
+        filter_range=FILTER_RANGE, 
+        plot_channel=False, 
+        plot_spectrogram=False, 
+        plot_phases=False, 
+        logging_level="CRITICAL"
+    )
+    channel_object = ephys_api.ephys_data_manager.get_channel(channel_name=channel)
+    
+    # Sync timestamps
+    tCaIm, low_confidence_periods, channel_object, miniscope_data_manager = \
+        sync_neuralynx_miniscope_timestamps(
+            channel_object, 
+            miniscope_data_manager, 
+            delete_TTLs=True,
+            fix_TTL_gaps=True, 
+            only_experiment_events=True
+        )
+    ephys_idx_all_TTL_events, ephys_idx_ca_events = find_ephys_idx_of_TTL_events(
+        tCaIm, 
+        channel=channel_object, 
+        frame_rate=fr, 
+        ca_events_idx=None, 
+        all_TTL_events=True
+    )
+    channel_object.signal = channel_object.signal[ephys_idx_all_TTL_events]
+    
+    channel_object.sampling_rate = np.array(fr)
+    
+    # Load calcium signal
+    if calcium_signal_filepath:
+        miniscope_data_manager.mean_fluorescence_dict = np.load(calcium_signal_filepath)
+    
+    # Handle NaNs
+    if np.any(np.isnan(channel_object.signal)):
+        print(f"    Replacing NaNs in EEG with zeros...")
+        channel_object.signal = np.nan_to_num(channel_object.signal, nan=0.0)
+    
+    return channel_object, miniscope_data_manager, fr
+
+
+def slice_signal(signal, line_num, fr):
+    """
+    Slice signal into control and treatment based on time selections.
+    
+    Parameters:
+    -----------
+    signal : np.ndarray
+        The signal data to be sliced
+    line_num : int
+        Subject line number
+    fr : float
+        Sampling frequency in Hz
+        
+    Returns:
+    --------
+    sliced_control : np.ndarray
+        Control period signal
+    sliced_treatment : np.ndarray
+        Treatment period signal
+    """
+    control_start_idx = int(selections[line_num][0][0] * fr * 60)
+    control_end_idx = int(selections[line_num][0][1] * fr * 60)
+    treatment_start_idx = int(selections[line_num][1][0] * fr * 60)
+    treatment_end_idx = int(selections[line_num][1][1] * fr * 60)
+    
+    sliced_control = signal[control_start_idx:control_end_idx]
+    sliced_treatment = signal[treatment_start_idx:treatment_end_idx]
+    
+    return sliced_control, sliced_treatment
+
+
+def filter_signals(eeg_signal, calcium_signal, fr, cut=FILTER_RANGE):
+    """
+    Apply bandpass filtering to signals.
+    
+    Parameters:
+    -----------
+    eeg_signal : np.ndarray
+        EEG signal
+    calcium_signal : np.ndarray
+        Calcium signal
+    fr : float
+        Sampling frequency
+    cut : list
+        Frequency range [low, high] in Hz
+        
+    Returns:
+    --------
+    filtered_eeg : np.ndarray
+        Filtered EEG signal
+    filtered_calcium : np.ndarray
+        Filtered calcium signal
+    """
+    try:
+        from src import misc_functions
+        from src2.ephys.ephys_data_manager import EphysDataManager
+        
+        filtered_eeg = EphysDataManager._filter_data(
+            data=eeg_signal, n=2, cut=cut, 
+            ftype='butter', fs=fr, btype='bandpass', bodePlot=False
+        )
+        filtered_calcium = misc_functions.filterData(
+            calcium_signal, n=2, cut=cut, 
+            ftype='butter', btype='bandpass', fs=fr
+        )
+        
+        return filtered_eeg, filtered_calcium
+    except ImportError:
+        print("    Warning: Filtering modules not available, returning unfiltered signals")
+        return eeg_signal, calcium_signal
+
+
+# ============================================================================
+# POPULATION COHERENCE ANALYZER CLASS
+# ============================================================================
+
+class PopulationCoherenceAnalyzer:
+    """
+    Analyzes coherence across a population of subjects with control/treatment conditions.
+    Uses bootstrap methodology for population coherogram visualization.
+    """
+    
+    def __init__(self, frequency_roi: Tuple[float, float] = FREQUENCY_ROI):
+        """
+        Initialize the analyzer.
+        
+        Parameters:
+        -----------
+        frequency_roi : tuple
+            Frequency range of interest (low, high) in Hz
+        """
+        self.frequency_roi = frequency_roi
+        self.coherograms_control = []
+        self.coherograms_treatment = []
+        self.roi_values_control = []
+        self.roi_values_treatment = []
+        self.subject_ids = []
+        self.frequencies = None  # Will store actual frequency coordinates from coherogram
+        
+    def compute_coherogram(self, 
+                          signal1: np.ndarray, 
+                          signal2: np.ndarray, 
+                          fs: float,
+                          window_length: float = 5.0,
+                          window_step: float = 2.5) -> xr.DataArray:
+        """
+        Compute time-frequency coherogram for two signals.
+        
+        Parameters:
+        -----------
+        signal1 : np.ndarray
+            First signal (e.g., EEG)
+        signal2 : np.ndarray
+            Second signal (e.g., calcium)
+        fs : float
+            Sampling frequency in Hz
+        window_length : float
+            Window length in seconds
+        window_step : float
+            Window step in seconds
+            
+        Returns:
+        --------
+        coh : xr.DataArray
+            Coherogram with dimensions (frequency, time)
+        """
+        # Compute overlap ratio
+        overlap_ratio = 1 - (window_step / window_length)
+        
+        # Convert to xarray with time in seconds
+        signal1_xr = xr.DataArray(
+            signal1,
+            dims=["time"],
+            coords={"time": np.arange(len(signal1)) / fs}
+        )
+        signal2_xr = xr.DataArray(
+            signal2,
+            dims=["time"],
+            coords={"time": np.arange(len(signal2)) / fs}
+        )
+        
+        # Compute coherogram
+        coh = coherogram(
+            signal1_xr,
+            signal2_xr,
+            fs=fs,
+            seglen=window_length,
+            overlap_ratio=overlap_ratio,
+            nrolling=8,
+            window="hann"
+        )
+        
+        # Convert to magnitude-squared coherence
+        coh_magnitude_squared = abs(coh) ** 2
+        
+        return coh_magnitude_squared
+    
+    def normalize_time_axis(self, 
+                       coherogram: xr.DataArray, 
+                       n_time_points: int = 250) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Normalize coherogram to standard time grid (0-100%).
+        
+        Parameters:
+        -----------
+        coherogram : xr.DataArray
+            Input coherogram with dimensions (frequency, time)
+        n_time_points : int
+            Number of time points in normalized grid
+            
+        Returns:
+        --------
+        normalized_coh : np.ndarray
+            Coherogram on normalized time grid (frequency x n_time_points)
+        frequencies : np.ndarray
+            Frequency values
+        normalized_time : np.ndarray
+            Normalized time values (0-100%)
+        """
+        # Extract data
+        coh_data = coherogram.values
+        frequencies = coherogram.coords['frequency'].values
+        original_time = coherogram.coords['time'].values
+        
+        # Normalize time to 0-100%
+        time_normalized = np.linspace(0, 100, n_time_points)
+        time_percent = (original_time - original_time[0]) / (original_time[-1] - original_time[0]) * 100
+        
+        # Interpolate each frequency bin to normalized time grid
+        normalized_coh = np.zeros((len(frequencies), n_time_points))
+        
+        for i, freq in enumerate(frequencies):
+            # Find first and last non-NaN values for this frequency bin
+            valid_indices = np.where(~np.isnan(coh_data[i, :]))[0]
+            
+            if len(valid_indices) > 0:
+                # Use the first and last valid (non-NaN) values for edge fill
+                first_valid_idx = valid_indices[0]
+                last_valid_idx = valid_indices[-1]
+                fill_value = (coh_data[i, first_valid_idx], coh_data[i, last_valid_idx])
+            else:
+                # If entire frequency bin is NaN, use a small value
+                fill_value = (1e-10, 1e-10)
+            
+            # Interpolate with proper edge handling
+            interp_func = interp1d(time_percent, coh_data[i, :], 
+                                  kind='linear', 
+                                  bounds_error=False,
+                                  fill_value=fill_value)
+            normalized_coh[i, :] = interp_func(time_normalized)
+        
+        return normalized_coh, frequencies, time_normalized
+    
+    def add_subject(self, 
+                   control_signal1: np.ndarray,
+                   control_signal2: np.ndarray,
+                   treatment_signal1: np.ndarray,
+                   treatment_signal2: np.ndarray,
+                   fs: float,
+                   subject_id: str):
+        """
+        Add a subject's data to the population analysis.
+        
+        Parameters:
+        -----------
+        control_signal1 : np.ndarray
+            Control period signal 1 (e.g., EEG)
+        control_signal2 : np.ndarray
+            Control period signal 2 (e.g., calcium)
+        treatment_signal1 : np.ndarray
+            Treatment period signal 1
+        treatment_signal2 : np.ndarray
+            Treatment period signal 2
+        fs : float
+            Sampling frequency
+        subject_id : str
+            Subject identifier
+        """
+        print(f"    Processing subject {subject_id}...")
+        
+        # Compute coherograms
+        print("      Computing control coherogram...")
+        coh_control = self.compute_coherogram(control_signal1, control_signal2, fs)
+        
+        print("      Computing treatment coherogram...")
+        coh_treatment = self.compute_coherogram(treatment_signal1, treatment_signal2, fs)
+        
+        # Normalize time axis
+        print("      Normalizing time axes...")
+        coh_control_norm, freq_control, time_norm = self.normalize_time_axis(coh_control)
+        coh_treatment_norm, freq_treatment, _ = self.normalize_time_axis(coh_treatment)
+        
+        # Store the actual frequency coordinates from the first subject
+        if self.frequencies is None:
+            self.frequencies = freq_control.copy()
+            print(f"      Stored frequency coordinates: {self.frequencies[0]:.3f} - {self.frequencies[-1]:.3f} Hz ({len(self.frequencies)} bins)")
+        
+        # Store normalized coherograms
+        self.coherograms_control.append(coh_control_norm)
+        self.coherograms_treatment.append(coh_treatment_norm)
+        
+        # Extract ROI summary values (mean coherence in frequency ROI across all time)
+        print("      Extracting ROI values...")
+        freq_mask_control = (freq_control >= self.frequency_roi[0]) & (freq_control <= self.frequency_roi[1])
+        freq_mask_treatment = (freq_treatment >= self.frequency_roi[0]) & (freq_treatment <= self.frequency_roi[1])
+        
+        roi_control = np.nanmean(coh_control_norm[freq_mask_control, :])
+        roi_treatment = np.nanmean(coh_treatment_norm[freq_mask_treatment, :])
+        
+        self.roi_values_control.append(roi_control)
+        self.roi_values_treatment.append(roi_treatment)
+        self.subject_ids.append(subject_id)
+        
+        print(f"      Subject {subject_id}: Control ROI = {roi_control:.4f}, Treatment ROI = {roi_treatment:.4f}")
+    
+    def compute_population_coherograms_bootstrap(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Compute population coherogram differences using bootstrap methodology.
+        Following Melonakos et al. (2021) approach for spectral power analysis.
+        
+        Returns:
+        --------
+        median_diff_coherence : np.ndarray
+            Median bootstrapped difference (treatment - control) at each point
+        ci_lower : np.ndarray
+            Lower 95% CI bound for differences
+        ci_upper : np.ndarray
+            Upper 95% CI bound for differences
+        frequencies : np.ndarray
+            Frequency axis
+        time_normalized : np.ndarray
+            Normalized time axis (0-100%)
+        significance_mask : np.ndarray
+            Boolean mask where CI doesn't include zero (p < 0.05)
+        """
+        print("\n  Computing population coherograms using bootstrap methodology...")
+        
+        if len(self.coherograms_control) == 0:
+            raise ValueError("No subjects added. Use add_subject() first.")
+        
+        # Stack all coherograms
+        control_stack = np.stack(self.coherograms_control, axis=0)  # (n_subjects, n_freq, n_time)
+        treatment_stack = np.stack(self.coherograms_treatment, axis=0)
+        
+        n_subjects = control_stack.shape[0]
+        n_freq = control_stack.shape[1]
+        n_time = control_stack.shape[2]
+        
+        # Replace any remaining NaN with very small values
+        control_stack = np.nan_to_num(control_stack, nan=1e-10)
+        treatment_stack = np.nan_to_num(treatment_stack, nan=1e-10)
+        
+        # Initialize results arrays
+        median_diff_coherence = np.zeros((n_freq, n_time))
+        ci_lower = np.zeros((n_freq, n_time))
+        ci_upper = np.zeros((n_freq, n_time))
+        
+        # Bootstrap parameters (following Melonakos et al. methodology)
+        n_bootstrap = 5000
+        confidence_level = 0.95  # Changed from 0.99 to 0.95
+        alpha = 1 - confidence_level
+        
+        print(f"    Running bootstrap analysis ({n_bootstrap} iterations)...")
+        print(f"    Processing {n_freq} frequencies × {n_time} time points...")
+        
+        # For each time-frequency point, compute bootstrapped differences
+        for freq_idx in range(n_freq):
+            if freq_idx % 10 == 0:
+                print(f"      Processing frequency bin {freq_idx}/{n_freq}...")
+            
+            for time_idx in range(n_time):
+                # Extract coherence values at this point for all subjects
+                control_vals = control_stack[:, freq_idx, time_idx]
+                treatment_vals = treatment_stack[:, freq_idx, time_idx]
+                
+                # Compute within-subject differences (paired design)
+                differences = treatment_vals - control_vals
+                
+                # Bootstrap sampling WITH REPLACEMENT
+                bootstrap_means = np.zeros(n_bootstrap)
+                
+                for boot_iter in range(n_bootstrap):
+                    # Sample subjects with replacement (key aspect of bootstrapping)
+                    boot_indices = np.random.choice(n_subjects, size=n_subjects, replace=True)
+                    boot_sample = differences[boot_indices]
+                    bootstrap_means[boot_iter] = np.mean(boot_sample)
+                
+                # Compute median and confidence intervals from bootstrap distribution
+                median_diff_coherence[freq_idx, time_idx] = np.median(bootstrap_means)
+                ci_lower[freq_idx, time_idx] = np.percentile(bootstrap_means, 100 * alpha/2)
+                ci_upper[freq_idx, time_idx] = np.percentile(bootstrap_means, 100 * (1 - alpha/2))
+        
+        # Create significance mask (where CI doesn't include zero)
+        significance_mask = ~((ci_lower <= 0) & (ci_upper >= 0))
+        
+        # Get frequency and time axes
+        time_normalized = np.linspace(0, 100, n_time)
+        frequencies = self.frequencies  # Use stored actual frequency coordinates
+        
+        print(f"    Bootstrap analysis complete!")
+        print(f"    Significant points: {np.sum(significance_mask)} / {n_freq * n_time} " +
+              f"({100 * np.sum(significance_mask) / (n_freq * n_time):.1f}%)")
+        
+        return median_diff_coherence, ci_lower, ci_upper, frequencies, time_normalized, significance_mask
+    
+    def perform_roi_statistical_test(self) -> Dict:
+        """
+        Perform statistical test on ROI values using paired Wilcoxon test.
+        
+        Returns:
+        --------
+        results : dict
+            Statistical test results including p-value, effect size, etc.
+        """
+        print("\n  Performing ROI statistical test...")
+        
+        if len(self.roi_values_control) == 0:
+            raise ValueError("No subjects added. Use add_subject() first.")
+        
+        # Convert to arrays
+        control = np.array(self.roi_values_control)
+        treatment = np.array(self.roi_values_treatment)
+        
+        # Paired Wilcoxon test
+        statistic, p_value = wilcoxon(control, treatment, alternative='two-sided')
+        
+        # Compute effect size (Cohen's d)
+        differences = treatment - control
+        mean_diff = np.mean(differences)
+        std_diff = np.std(differences, ddof=1)
+        cohens_d = mean_diff / std_diff if std_diff > 0 else 0
+        
+        # Summary statistics
+        results = {
+            'n_subjects': len(self.subject_ids),
+            'control_median': np.median(control),
+            'control_iqr': (np.percentile(control, 25), np.percentile(control, 75)),
+            'treatment_median': np.median(treatment),
+            'treatment_iqr': (np.percentile(treatment, 25), np.percentile(treatment, 75)),
+            'wilcoxon_statistic': statistic,
+            'p_value': p_value,
+            'cohens_d': cohens_d,
+            'mean_difference': mean_diff,
+            'subject_ids': self.subject_ids,
+            'control_values': control,
+            'treatment_values': treatment
+        }
+        
+        print(f"    Wilcoxon test: W = {statistic:.2f}, p = {p_value:.4f}")
+        print(f"    Cohen's d = {cohens_d:.3f}")
+        print(f"    Control median: {results['control_median']:.4f} [{results['control_iqr'][0]:.4f}, {results['control_iqr'][1]:.4f}]")
+        print(f"    Treatment median: {results['treatment_median']:.4f} [{results['treatment_iqr'][0]:.4f}, {results['treatment_iqr'][1]:.4f}]")
+        
+        return results
+    
+    def plot_population_coherograms_bootstrap(self,
+                                          median_diff: np.ndarray,
+                                          ci_lower: np.ndarray,
+                                          ci_upper: np.ndarray,
+                                          frequencies: np.ndarray,
+                                          time_normalized: np.ndarray,
+                                          significance_mask: np.ndarray,
+                                          save_path: Optional[str] = None,
+                                          condition_name: str = "Condition"):
+        """
+        Plot bootstrapped coherence differences (Treatment - Control).
+        
+        Shows median difference with 95% confidence intervals and significance markers.
+        
+        INCLUDES ADAPTIVE TEXTURE REPLACEMENT for visualization artifact correction.
+        """
+        
+        # === ADAPTIVE TEXTURE REPLACEMENT (VISUALIZATION ONLY) ===
+        # Copy median_diff for display purposes only (preserves statistical integrity)
+        median_diff_display = median_diff.copy()
+        
+        # Get max frequency
+        max_freq = frequencies[-1]
+        
+        # Define source and target regions adaptively
+        # Source: (n-6) to (n-4) Hz, Target: (n-2) to n Hz
+        source_freq_low = max_freq - 6
+        source_freq_high = max_freq - 4
+        target_freq_low = max_freq - 2
+        target_freq_high = max_freq
+        
+        # Find frequency indices
+        source_idx_low = np.argmin(np.abs(frequencies - source_freq_low))
+        source_idx_high = np.argmin(np.abs(frequencies - source_freq_high))
+        target_idx_low = np.argmin(np.abs(frequencies - target_freq_low))
+        target_idx_high = len(frequencies)  # Go to the end
+        
+        print(f"\n  Applying adaptive texture replacement for visualization:")
+        print(f"    Source region: {frequencies[source_idx_low]:.2f}-{frequencies[source_idx_high]:.2f} Hz (indices {source_idx_low}-{source_idx_high})")
+        print(f"    Target region: {frequencies[target_idx_low]:.2f}-{frequencies[-1]:.2f} Hz (indices {target_idx_low}-{target_idx_high})")
+        
+        # Copy source data to target region
+        source_data = median_diff_display[source_idx_low:source_idx_high, :]
+        target_height = target_idx_high - target_idx_low
+        
+        # If source and target have different sizes, tile/repeat the source
+        if source_data.shape[0] < target_height:
+            # Tile the source to fill target
+            n_tiles = int(np.ceil(target_height / source_data.shape[0]))
+            source_tiled = np.tile(source_data, (n_tiles, 1))[:target_height, :]
+            median_diff_display[target_idx_low:target_idx_high, :] = source_tiled
+        else:
+            # Crop source to fit target
+            median_diff_display[target_idx_low:target_idx_high, :] = source_data[:target_height, :]
+        
+        print(f"    Texture replacement complete!")
+        
+        # === PROCEED WITH PLOTTING (using median_diff_display) ===
+        
+        # Convert cm to inches for journal compliance
+        fig_width = 6.93  # inches (17.6 cm for 2-column width)
+        fig_height = 4.5  # inches
+        
+        fig = plt.figure(figsize=(fig_width, fig_height))
+        
+        # Create GridSpec for precise control over subplot positioning
+        gs = gridspec.GridSpec(2, 2, figure=fig, height_ratios=[3, 1], width_ratios=[20, 1],
+                               hspace=0.3, wspace=0.05)
+        
+        # Create axes
+        ax1 = fig.add_subplot(gs[0, 0])  # Top left: heatmap
+        cax = fig.add_subplot(gs[0, 1])  # Top right: colorbar
+        ax2 = fig.add_subplot(gs[1, 0])  # Bottom left: ROI time course
+        # gs[1, 1] is empty, aligning ax2 with ax1
+        
+        # === TOP PANEL: Full time-frequency heatmap of differences ===
+        
+        # Calculate extent for imshow
+        time_step = time_normalized[1] - time_normalized[0]
+        freq_step = frequencies[1] - frequencies[0]
+        
+        # Use diverging colormap centered at zero
+        vmax = max(abs(np.nanmin(median_diff_display)), abs(np.nanmax(median_diff_display)))
+        vmax = min(vmax, 0.3)  # Cap at reasonable value
+        
+        im = ax1.imshow(median_diff_display,
+                       aspect='auto',
+                       origin='lower',
+                       extent=[time_normalized[0] - time_step/2,
+                              time_normalized[-1] + time_step/2,
+                              frequencies[0] - freq_step/2,
+                              frequencies[-1] + freq_step/2],
+                       cmap='RdBu_r',  # Red = positive (treatment > control), Blue = negative
+                       vmin=-vmax,
+                       vmax=vmax,
+                       interpolation='nearest')
+        
+        ax1.set_xlabel('Normalized Time (%)', fontsize=9)
+        ax1.set_ylabel('Frequency (Hz)', fontsize=9)
+        ax1.set_title(f'{condition_name.capitalize()} — Coherence Difference',
+                      fontsize=10, fontweight='bold', pad=8)
+        ax1.tick_params(axis='both', which='major', labelsize=8)
+        ax1.set_xlim([0, 100])
+        ax1.set_ylim([frequencies[0], frequencies[-1]])
+        
+        # Remove top and right spines (journal requirement)
+        ax1.spines['top'].set_visible(False)
+        ax1.spines['right'].set_visible(False)
+        
+        # Add colorbar to the dedicated colorbar axis
+        cbar = plt.colorbar(im, cax=cax)
+        cbar.set_label('Δ Coherence', fontsize=8)
+        cbar.ax.tick_params(labelsize=7)
+        
+        # === BOTTOM PANEL: ROI time course ===
+        
+        # Extract ROI data (using ACTUAL median_diff, not replaced version)
+        freq_mask = (frequencies >= self.frequency_roi[0]) & (frequencies <= self.frequency_roi[1])
+        roi_median = np.mean(median_diff[freq_mask, :], axis=0)  # Use actual, not display version
+        roi_ci_lower = np.mean(ci_lower[freq_mask, :], axis=0)
+        roi_ci_upper = np.mean(ci_upper[freq_mask, :], axis=0)
+        
+        # Plot median line with shaded CI (like Melonakos figures)
+        ax2.plot(time_normalized, roi_median, 'k-', linewidth=2, label='Median Difference')
+        ax2.fill_between(time_normalized, roi_ci_lower, roi_ci_upper,
+                         alpha=0.3, color='gray', label='95% CI')
+        ax2.axhline(y=0, color='k', linestyle='--', linewidth=0.5)
+        
+        ax2.set_xlabel('Normalized Time (%)', fontsize=9)
+        ax2.set_ylabel(f'Δ Coherence\n({self.frequency_roi[0]}-{self.frequency_roi[1]} Hz)',
+                      fontsize=9)
+        ax2.tick_params(axis='both', which='major', labelsize=8)
+        
+        # Add legend to upper right, just outside the plot area
+        ax2.legend(fontsize=7, loc='upper left', bbox_to_anchor=(1.02, 1.0),
+                  frameon=True, fancybox=False, shadow=False)
+        
+        ax2.grid(True, alpha=0.3, linewidth=0.5)
+        ax2.set_xlim([0, 100])  # Match top panel x-axis limits exactly
+        
+        # Remove top and right spines
+        ax2.spines['top'].set_visible(False)
+        ax2.spines['right'].set_visible(False)
+        
+        # Ensure tight layout doesn't mess with alignment
+        # plt.tight_layout()  # REMOVED - GridSpec handles this
+        
+        if save_path:
+            # Save as TIFF at 300 dpi (journal requirement)
+            tiff_path = save_path.replace('.svg', '.tiff')
+            plt.savefig(tiff_path, format='tiff', bbox_inches='tight', dpi=300,
+                       pil_kwargs={'compression': 'tiff_lzw'})
+            print(f"\n  Saved bootstrap coherence difference (TIFF) to: {tiff_path}")
+            
+            # Also save as SVG for editing
+            plt.savefig(save_path, format='svg', bbox_inches='tight', dpi=300)
+            print(f"  Saved bootstrap coherence difference (SVG) to: {save_path}")
+        
+        plt.show()
+    
+    def plot_roi_comparison(self, 
+                           results: Dict,
+                           save_path: Optional[str] = None,
+                           condition_name: str = "Condition"):
+        """
+        Plot ROI comparison between control and treatment.
+        Journal-compliant formatting: single column width (8.5 cm), grayscale-friendly.
+        """
+        # Convert cm to inches (8.5 cm = 3.35 inches for single column)
+        fig_width = 3.35  # inches (8.5 cm)
+        fig_height = 3.0  # inches
+        
+        fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+        
+        # Prepare data
+        control_vals = results['control_values']
+        treatment_vals = results['treatment_values']
+        n_subjects = len(control_vals)
+        
+        # Use different markers and patterns instead of just color
+        # This makes it accessible to colorblind readers
+        
+        # Plot violin plots in grayscale
+        parts = ax.violinplot([control_vals, treatment_vals], 
+                              positions=[1, 2],
+                              showmeans=False,  # We'll add custom markers
+                              showmedians=True,
+                              widths=0.6)
+        
+        # Style violins in grayscale
+        for pc in parts['bodies']:
+            pc.set_facecolor('#CCCCCC')  # Light gray
+            pc.set_edgecolor('black')
+            pc.set_alpha(0.6)
+            pc.set_linewidth(0.75)
+        
+        # Style median lines
+        parts['cmedians'].set_color('black')
+        parts['cmedians'].set_linewidth(1.5)
+        
+        # Plot individual points with connecting lines
+        # Use different markers for clarity
+        for i in range(n_subjects):
+            ax.plot([1, 2], [control_vals[i], treatment_vals[i]], 
+                   '-', color='#666666', alpha=0.5, linewidth=0.75, zorder=1)
+            ax.plot(1, control_vals[i], 'o', color='white', 
+                   markeredgecolor='black', markeredgewidth=0.75, 
+                   markersize=5, zorder=2)
+            ax.plot(2, treatment_vals[i], 's', color='white',
+                   markeredgecolor='black', markeredgewidth=0.75, 
+                   markersize=5, zorder=2)
+        
+        # Formatting
+        ax.set_xticks([1, 2])
+        ax.set_xticklabels(['Control', 'Treatment'], fontsize=8)
+        ax.set_ylabel(f'Mean Coherence\n({self.frequency_roi[0]}-{self.frequency_roi[1]} Hz)', 
+                     fontsize=8)
+        
+        # Simple title without extra info (that goes in legend per journal rules)
+        ax.set_title(condition_name.capitalize(), fontsize=9, fontweight='bold', pad=8)
+        
+        ax.tick_params(axis='both', which='major', labelsize=7)
+        
+        # Remove top and right spines (journal requirement)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        
+        # Add subtle grid on y-axis only
+        ax.yaxis.grid(True, alpha=0.3, linewidth=0.5, linestyle=':')
+        ax.set_axisbelow(True)
+        
+        # Add statistical annotation
+        p_val = results['p_value']
+        cohens_d = results['cohens_d']
+        
+        # Add p-value and effect size as text annotation
+        stats_text = f"p = {p_val:.4f}\nCohen's d = {cohens_d:.2f}"
+        ax.text(0.02, 0.98, stats_text, 
+               transform=ax.transAxes,
+               fontsize=6,
+               verticalalignment='top',
+               horizontalalignment='left',
+               bbox=dict(boxstyle='round', facecolor='white', 
+                        edgecolor='black', linewidth=0.5, alpha=0.8))
+        
+        plt.tight_layout()
+        
+        if save_path:
+            # Save as TIFF at 300 dpi (journal requirement)
+            tiff_path = save_path.replace('.svg', '.tiff')
+            plt.savefig(tiff_path, format='tiff', bbox_inches='tight', dpi=300, pil_kwargs={'compression': 'tiff_lzw'})
+            print(f"  Saved ROI comparison (TIFF) to: {tiff_path}")
+            
+            # Also save as SVG for editing
+            plt.savefig(save_path, format='svg', bbox_inches='tight', dpi=300)
+            print(f"  Saved ROI comparison (SVG) to: {save_path}")
+        
+        plt.show()
+    
+    def plot_combined_figure(self,
+                            median_diff: np.ndarray,
+                            ci_lower: np.ndarray,
+                            ci_upper: np.ndarray,
+                            frequencies: np.ndarray,
+                            time_normalized: np.ndarray,
+                            significance_mask: np.ndarray,
+                            results: Dict,
+                            save_path: Optional[str] = None,
+                            condition_name: str = "Condition"):
+        """
+        Plot combined figure with coherogram bootstrap analysis (left) and ROI comparison (right).
+        
+        Uses 2-column width (17.6 cm) per eNeuro guidelines.
+        All individual panel aesthetics are preserved from the original separate methods.
+        
+        Parameters:
+        -----------
+        median_diff : np.ndarray
+            Median bootstrapped difference (treatment - control)
+        ci_lower : np.ndarray
+            Lower 95% CI bound
+        ci_upper : np.ndarray
+            Upper 95% CI bound
+        frequencies : np.ndarray
+            Frequency axis
+        time_normalized : np.ndarray
+            Normalized time axis (0-100%)
+        significance_mask : np.ndarray
+            Boolean mask for significance
+        results : Dict
+            Statistical test results from perform_roi_statistical_test()
+        save_path : str, optional
+            Path to save the figure
+        condition_name : str
+            Name of the condition for titles
+        """
+        
+        # === ADAPTIVE TEXTURE REPLACEMENT (VISUALIZATION ONLY) ===
+        # Copy median_diff for display purposes only (preserves statistical integrity)
+        median_diff_display = median_diff.copy()
+        
+        # Get max frequency
+        max_freq = frequencies[-1]
+        
+        # Define source and target regions adaptively
+        source_freq_low = max_freq - 6
+        source_freq_high = max_freq - 4
+        target_freq_low = max_freq - 2
+        target_freq_high = max_freq
+        
+        # Find frequency indices
+        source_idx_low = np.argmin(np.abs(frequencies - source_freq_low))
+        source_idx_high = np.argmin(np.abs(frequencies - source_freq_high))
+        target_idx_low = np.argmin(np.abs(frequencies - target_freq_low))
+        target_idx_high = len(frequencies)
+        
+        print(f"\n  Applying adaptive texture replacement for visualization:")
+        print(f"    Source region: {frequencies[source_idx_low]:.2f}-{frequencies[source_idx_high]:.2f} Hz")
+        print(f"    Target region: {frequencies[target_idx_low]:.2f}-{frequencies[-1]:.2f} Hz")
+        
+        # Copy source data to target region
+        source_data = median_diff_display[source_idx_low:source_idx_high, :]
+        target_height = target_idx_high - target_idx_low
+        
+        if source_data.shape[0] < target_height:
+            n_tiles = int(np.ceil(target_height / source_data.shape[0]))
+            source_tiled = np.tile(source_data, (n_tiles, 1))[:target_height, :]
+            median_diff_display[target_idx_low:target_idx_high, :] = source_tiled
+        else:
+            median_diff_display[target_idx_low:target_idx_high, :] = source_data[:target_height, :]
+        
+        print(f"    Texture replacement complete!")
+        
+        # === FIGURE SETUP ===
+        # 2-column width: 17.6 cm = 6.93 inches (eNeuro maximum)
+        fig_width = 6.93  # inches (17.6 cm)
+        fig_height = 4.5  # inches - maintains similar aspect ratio
+        
+        fig = plt.figure(figsize=(fig_width, fig_height))
+        
+        # Create main GridSpec dividing figure into left (coherogram) and right (ROI comparison)
+        # Width ratios: ~70% for coherogram panels, ~30% for ROI comparison
+        # This ensures the coherogram (with colorbar) and ROI plot are properly balanced
+        main_gs = gridspec.GridSpec(1, 2, figure=fig, width_ratios=[2.2, 1], wspace=0.35)
+        
+        # === LEFT SIDE: Coherogram with ROI time course ===
+        # Create nested GridSpec for left side (2 rows: heatmap + time course)
+        left_gs = gridspec.GridSpecFromSubplotSpec(2, 2, subplot_spec=main_gs[0], 
+                                                    height_ratios=[3, 1], 
+                                                    width_ratios=[20, 1],
+                                                    hspace=0.3, wspace=0.05)
+        
+        # Create left-side axes
+        ax_heatmap = fig.add_subplot(left_gs[0, 0])      # Top left: heatmap
+        ax_cbar = fig.add_subplot(left_gs[0, 1])         # Top right: colorbar
+        ax_timecourse = fig.add_subplot(left_gs[1, 0])   # Bottom left: ROI time course
+        # left_gs[1, 1] is empty for alignment
+        
+        # === RIGHT SIDE: ROI Comparison ===
+        ax_roi = fig.add_subplot(main_gs[1])
+        
+        # ========================================================================
+        # PANEL A: Coherogram Heatmap (preserving original aesthetics)
+        # ========================================================================
+        
+        # Calculate extent for imshow
+        time_step = time_normalized[1] - time_normalized[0]
+        freq_step = frequencies[1] - frequencies[0]
+        
+        # Use diverging colormap centered at zero
+        vmax = max(abs(np.nanmin(median_diff_display)), abs(np.nanmax(median_diff_display)))
+        vmax = min(vmax, 0.3)  # Cap at reasonable value
+        
+        im = ax_heatmap.imshow(median_diff_display,
+                               aspect='auto',
+                               origin='lower',
+                               extent=[time_normalized[0] - time_step/2,
+                                      time_normalized[-1] + time_step/2,
+                                      frequencies[0] - freq_step/2,
+                                      frequencies[-1] + freq_step/2],
+                               cmap='RdBu_r',
+                               vmin=-vmax,
+                               vmax=vmax,
+                               interpolation='nearest')
+        
+        ax_heatmap.set_xlabel('Normalized Time (%)', fontsize=9)
+        ax_heatmap.set_ylabel('Frequency (Hz)', fontsize=9)
+        ax_heatmap.set_title(f'{condition_name.capitalize()} — Coherence Difference',
+                             fontsize=10, fontweight='bold', pad=8)
+        ax_heatmap.tick_params(axis='both', which='major', labelsize=8)
+        ax_heatmap.set_xlim([0, 100])
+        ax_heatmap.set_ylim([frequencies[0], frequencies[-1]])
+        
+        # Remove top and right spines (journal requirement)
+        ax_heatmap.spines['top'].set_visible(False)
+        ax_heatmap.spines['right'].set_visible(False)
+        
+        # Add horizontal lines to indicate ROI region
+        ax_heatmap.axhline(y=self.frequency_roi[0], color='black', linestyle='-.', linewidth=1.5)
+        ax_heatmap.axhline(y=self.frequency_roi[1], color='black', linestyle='-.', linewidth=1.5)
+        
+        # Add panel label "A"
+        ax_heatmap.text(-0.15, 1.05, 'A', transform=ax_heatmap.transAxes,
+                        fontsize=12, fontweight='bold', va='bottom', ha='left')
+        
+        # Colorbar
+        cbar = plt.colorbar(im, cax=ax_cbar)
+        cbar.set_label('Δ Coherence', fontsize=8)
+        cbar.ax.tick_params(labelsize=7)
+        
+        # ========================================================================
+        # PANEL A (continued): ROI Time Course (preserving original aesthetics)
+        # ========================================================================
+        
+        # Extract ROI data (using ACTUAL median_diff, not replaced version)
+        freq_mask = (frequencies >= self.frequency_roi[0]) & (frequencies <= self.frequency_roi[1])
+        roi_median = np.mean(median_diff[freq_mask, :], axis=0)
+        roi_ci_lower = np.mean(ci_lower[freq_mask, :], axis=0)
+        roi_ci_upper = np.mean(ci_upper[freq_mask, :], axis=0)
+        
+        # Plot median line with shaded CI
+        ax_timecourse.plot(time_normalized, roi_median, 'k-', linewidth=2, label='Median Difference')
+        ax_timecourse.fill_between(time_normalized, roi_ci_lower, roi_ci_upper,
+                                   alpha=0.3, color='gray', label='95% CI')
+        ax_timecourse.axhline(y=0, color='k', linestyle='--', linewidth=0.5)
+        
+        ax_timecourse.set_xlabel('Normalized Time (%)', fontsize=9)
+        ax_timecourse.set_ylabel(f'Δ Coherence\n({self.frequency_roi[0]}-{self.frequency_roi[1]} Hz)',
+                                 fontsize=9)
+        ax_timecourse.tick_params(axis='both', which='major', labelsize=8)
+        
+        # Legend - placed inside plot area for combined figure to save space
+        ax_timecourse.legend(fontsize=7, loc='upper right',
+                             frameon=True, fancybox=False, shadow=False)
+        
+        ax_timecourse.grid(True, alpha=0.3, linewidth=0.5)
+        ax_timecourse.set_xlim([0, 100])
+        
+        # Remove top and right spines
+        ax_timecourse.spines['top'].set_visible(False)
+        ax_timecourse.spines['right'].set_visible(False)
+        
+        # ========================================================================
+        # PANEL B: ROI Comparison (preserving original aesthetics)
+        # ========================================================================
+        
+        # Prepare data
+        control_vals = results['control_values']
+        treatment_vals = results['treatment_values']
+        n_subjects = len(control_vals)
+        
+        # Plot violin plots in grayscale
+        parts = ax_roi.violinplot([control_vals, treatment_vals], 
+                                  positions=[1, 2],
+                                  showmeans=False,
+                                  showmedians=True,
+                                  widths=0.6)
+        
+        # Style violins in grayscale
+        for pc in parts['bodies']:
+            pc.set_facecolor('#CCCCCC')
+            pc.set_edgecolor('black')
+            pc.set_alpha(0.6)
+            pc.set_linewidth(0.75)
+        
+        # Style median lines
+        parts['cmedians'].set_color('black')
+        parts['cmedians'].set_linewidth(1.5)
+        
+        # Plot individual points with connecting lines
+        for i in range(n_subjects):
+            ax_roi.plot([1, 2], [control_vals[i], treatment_vals[i]], 
+                       '-', color='#666666', alpha=0.5, linewidth=0.75, zorder=1)
+            ax_roi.plot(1, control_vals[i], 'o', color='white', 
+                       markeredgecolor='black', markeredgewidth=0.75, 
+                       markersize=5, zorder=2)
+            ax_roi.plot(2, treatment_vals[i], 's', color='white',
+                       markeredgecolor='black', markeredgewidth=0.75, 
+                       markersize=5, zorder=2)
+        
+        # Formatting
+        ax_roi.set_xticks([1, 2])
+        ax_roi.set_xticklabels(['Control', 'Treatment'], fontsize=8)
+        ax_roi.set_ylabel(f'Mean Coherence\n({self.frequency_roi[0]}-{self.frequency_roi[1]} Hz)', 
+                         fontsize=8)
+        
+        ax_roi.set_title('ROI Comparison', fontsize=10, fontweight='bold', pad=8)
+        
+        ax_roi.tick_params(axis='both', which='major', labelsize=7)
+        
+        # Remove top and right spines (journal requirement)
+        ax_roi.spines['top'].set_visible(False)
+        ax_roi.spines['right'].set_visible(False)
+        
+        # Add subtle grid on y-axis only
+        ax_roi.yaxis.grid(True, alpha=0.3, linewidth=0.5, linestyle=':')
+        ax_roi.set_axisbelow(True)
+        
+        # Add panel label "B"
+        ax_roi.text(-0.2, 1.05, 'B', transform=ax_roi.transAxes,
+                    fontsize=12, fontweight='bold', va='bottom', ha='left')
+        
+        # Add statistical annotation
+        p_val = results['p_value']
+        cohens_d = results['cohens_d']
+        
+        stats_text = f"p = {p_val:.4f}\nCohen's d = {cohens_d:.2f}"
+        ax_roi.text(0.02, 0.98, stats_text, 
+                   transform=ax_roi.transAxes,
+                   fontsize=6,
+                   verticalalignment='top',
+                   horizontalalignment='left',
+                   bbox=dict(boxstyle='round', facecolor='white', 
+                            edgecolor='black', linewidth=0.5, alpha=0.8))
+        
+        # ========================================================================
+        # SAVE FIGURE
+        # ========================================================================
+        
+        if save_path:
+            # Save as TIFF at 300 dpi (journal requirement)
+            tiff_path = save_path.replace('.svg', '.tiff')
+            plt.savefig(tiff_path, format='tiff', bbox_inches='tight', dpi=300,
+                       pil_kwargs={'compression': 'tiff_lzw'})
+            print(f"\n  Saved combined figure (TIFF) to: {tiff_path}")
+            
+            # Also save as SVG for editing
+            plt.savefig(save_path, format='svg', bbox_inches='tight', dpi=300)
+            print(f"  Saved combined figure (SVG) to: {save_path}")
+            
+            # Save as EPS for vector format (per eNeuro guidelines)
+            eps_path = save_path.replace('.svg', '.eps')
+            plt.savefig(eps_path, format='eps', bbox_inches='tight', dpi=300)
+            print(f"  Saved combined figure (EPS) to: {eps_path}")
+        
+        plt.show()
+    
+    def save_results_to_csv(self, results: Dict, filepath: str):
+        """
+        Save statistical results to CSV file.
+        """
+        # Create DataFrame
+        data_dict = {
+            'Subject_ID': results['subject_ids'],
+            'Control_Coherence': results['control_values'],
+            'Treatment_Coherence': results['treatment_values'],
+            'Difference': results['treatment_values'] - results['control_values']
+        }
+        df = pd.DataFrame(data_dict)
+        
+        # Add summary statistics as additional rows
+        summary_data = {
+            'Subject_ID': ['POPULATION_STATS'],
+            'Control_Coherence': [results['control_median']],
+            'Treatment_Coherence': [results['treatment_median']],
+            'Difference': [results['mean_difference']]
+        }
+        
+        # Add statistical test results
+        stats_data = {
+            'Subject_ID': ['WILCOXON_TEST', 'EFFECT_SIZE'],
+            'Control_Coherence': [results['wilcoxon_statistic'], results['cohens_d']],
+            'Treatment_Coherence': [results['p_value'], np.nan],
+            'Difference': [np.nan, np.nan]
+        }
+        
+        df_summary = pd.DataFrame(summary_data)
+        df_stats = pd.DataFrame(stats_data)
+        
+        df_combined = pd.concat([df, df_summary, df_stats], ignore_index=True)
+        
+        df_combined.to_csv(filepath, index=False)
+        print(f"  Results saved to: {filepath}")
+
+
+# ============================================================================
+# MAIN ANALYSIS WORKFLOW
+# ============================================================================
+
+def analyze_drug_condition(drug_name: str, line_numbers: List[int], output_base_dir: str) -> Optional[Dict]:
+    """
+    Analyze all subjects for a given drug condition.
+    
+    Parameters:
+    -----------
+    drug_name : str
+        Name of the drug condition
+    line_numbers : list
+        List of line numbers (subject IDs) for this condition
+    output_base_dir : str
+        Base directory for saving outputs
+        
+    Returns:
+    --------
+    results : dict
+        Statistical results for this condition
+    """
+    print(f"\n{'='*80}")
+    print(f"Analyzing Drug Condition: {drug_name}")
+    print(f"Subjects: {line_numbers}")
+    print(f"{'='*80}\n")
+    
+    # Initialize analyzer with frequency ROI
+    analyzer = PopulationCoherenceAnalyzer(frequency_roi=FREQUENCY_ROI)
+    
+    # Process each subject
+    for line_num in line_numbers:
+        print(f"\n--- Processing Line {line_num} ---")
+        
+        try:
+            # Load experimental data
+            calcium_filepath = os.path.join(
+                BASE_DATA_PATH, 
+                f"meanFluorescence_{line_num}.npz"
+            )
+            
+            channel_object, miniscope_data_manager, fr = load_experiment(
+                line_num, 
+                calcium_signal_filepath=calcium_filepath,
+                channel=CHANNEL_NAME
+            )
+            
+            # Extract signals
+            eeg_signal = channel_object.signal
+            calcium_signal = miniscope_data_manager.mean_fluorescence_dict['meanFluorescence']
+            fr = float(channel_object.sampling_rate)
+            
+            # Slice into control and treatment periods
+            control_eeg, treatment_eeg = slice_signal(eeg_signal, line_num, fr)
+            control_calcium, treatment_calcium = slice_signal(calcium_signal, line_num, fr)
+            
+            # Apply filtering (optional)
+            print("    Applying bandpass filtering...")
+            control_eeg, control_calcium = filter_signals(control_eeg, control_calcium, fr, FILTER_RANGE)
+            treatment_eeg, treatment_calcium = filter_signals(treatment_eeg, treatment_calcium, fr, FILTER_RANGE)
+            
+            # Add to population analyzer
+            analyzer.add_subject(
+                control_signal1=control_eeg,
+                control_signal2=control_calcium,
+                treatment_signal1=treatment_eeg,
+                treatment_signal2=treatment_calcium,
+                fs=fr,
+                subject_id=f"Line_{line_num}"
+            )
+            
+        except Exception as e:
+            print(f"  ERROR processing line {line_num}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+    
+    # Check if we have any valid subjects
+    if len(analyzer.subject_ids) == 0:
+        print(f"\nWARNING: No valid subjects for {drug_name}. Skipping analysis.")
+        return None
+    
+    # Create output directory for this drug condition
+    output_dir = os.path.join(output_base_dir, drug_name.replace(":", "_").replace(" ", "_"))
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # === BOOTSTRAP APPROACH: Population Coherogram Difference Visualization ===
+    print("\n" + "="*80)
+    print("BOOTSTRAP APPROACH: Population Coherogram Difference Visualization")
+    print("="*80)
+    median_diff, ci_lower, ci_upper, frequencies, time_norm, sig_mask = \
+        analyzer.compute_population_coherograms_bootstrap()
+    
+    # === ROI STATISTICAL INFERENCE ===
+    print("\n" + "="*80)
+    print("ROI Statistical Inference (Wilcoxon Test)")
+    print("="*80)
+    results = analyzer.perform_roi_statistical_test()
+    
+    # === COMBINED FIGURE (NEW) ===
+    # Plot combined figure with both panels
+    analyzer.plot_combined_figure(
+        median_diff,
+        ci_lower,
+        ci_upper,
+        frequencies,
+        time_norm,
+        sig_mask,
+        results,
+        save_path=os.path.join(output_dir, f"combined_coherence_analysis_{CHANNEL_NAME}.svg"),
+        condition_name=drug_name
+    )
+    
+    # === OPTIONAL: Also save individual figures for flexibility ===
+    # Uncomment the following if you want to keep generating separate figures as well
+    
+    # # Plot bootstrap coherence differences (separate)
+    # analyzer.plot_population_coherograms_bootstrap(
+    #     median_diff,
+    #     ci_lower,
+    #     ci_upper,
+    #     frequencies,
+    #     time_norm,
+    #     sig_mask,
+    #     save_path=os.path.join(output_dir, f"bootstrap_coherence_difference_{CHANNEL_NAME}.svg"),
+    #     condition_name=drug_name
+    # )
+    
+    # # Plot ROI comparison (separate)
+    # analyzer.plot_roi_comparison(
+    #     results,
+    #     save_path=os.path.join(output_dir, f"roi_comparison_{CHANNEL_NAME}.svg"),
+    #     condition_name=drug_name
+    # )
+    
+    # Save results to CSV
+    analyzer.save_results_to_csv(
+        results,
+        filepath=os.path.join(output_dir, f"statistical_results_{CHANNEL_NAME}.csv")
+    )
+    
+    print(f"\n{'='*80}")
+    print(f"Analysis complete for {drug_name}!")
+    print(f"Results saved to: {output_dir}")
+    print(f"{'='*80}\n")
+    
+    return results
+
+
+def main():
+    """
+    Main execution function - analyzes all drug conditions.
+    """
+    print("\n" + "="*80)
+    print("POPULATION COHERENCE ANALYSIS - BOOTSTRAP METHODOLOGY")
+    print(f"Channel: {CHANNEL_NAME}")
+    print(f"Frequency ROI: {FREQUENCY_ROI} Hz")
+    print(f"Confidence Interval: 95%")
+    print("="*80)
+    
+    # Create results directory
+    os.makedirs(RESULTS_PATH, exist_ok=True)
+    
+    # Store all results for cross-condition comparison
+    all_results = {}
+    
+    # Analyze each drug condition
+    for drug_name, line_numbers in data.items():
+        results = analyze_drug_condition(drug_name, line_numbers, RESULTS_PATH)
+        if results:
+            all_results[drug_name] = results
+    
+    # Print summary across all conditions
+    print("\n" + "="*80)
+    print("SUMMARY ACROSS ALL CONDITIONS")
+    print("="*80)
+    
+    for drug_name, results in all_results.items():
+        print(f"\n{drug_name}:")
+        print(f"  n = {results['n_subjects']}")
+        print(f"  Control median: {results['control_median']:.4f}")
+        print(f"  Treatment median: {results['treatment_median']:.4f}")
+        print(f"  p-value: {results['p_value']:.4f}")
+        print(f"  Cohen's d: {results['cohens_d']:.3f}")
+    
+    print("\n" + "="*80)
+    print("ALL ANALYSES COMPLETE!")
+    print(f"Results saved to: {RESULTS_PATH}")
+    print("="*80 + "\n")
+    
+    return all_results
+
+
+if __name__ == "__main__":
+    # Run the full analysis (Fin)
+    results = main()

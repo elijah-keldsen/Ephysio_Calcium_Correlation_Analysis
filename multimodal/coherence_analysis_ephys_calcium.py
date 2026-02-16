@@ -1,0 +1,775 @@
+import matplotlib.pyplot as plt
+import numpy as np
+import xarray as xr
+from xrscipy.signal.spectral import coherogram
+from scipy.signal import correlate, correlation_lags
+from scipy.signal import coherence
+import pandas as pd
+from src import misc_functions
+import os
+from src.multitaper_spectrogram_python import multitaper_spectrogram
+from src2.miniscope.miniscope_data_manager import MiniscopeDataManager
+from src2.ephys.ephys_api import EphysAPI
+from src2.ephys.ephys_data_manager import EphysDataManager
+from src2.multimodal.miniscope_ephys_alignment_utils import sync_neuralynx_miniscope_timestamps, find_ephys_idx_of_TTL_events
+from scipy.stats import wilcoxon
+
+
+#%% metadata
+#35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 64, 83, 85, 86, 87, 88, 90, 92, 93, 94, 96, 97, 99, 101, 103, 104, 105, 107, 108, 112
+ 
+line_nums = [46, 47, 64, 88, 97, 101]
+channel = 'CBvsPCEEG' # ['PFCLFPvsCBEEG', 'PFCEEGvsCBEEG', 'CBvsPCEEG']
+CUT = [0.5, 4] #frequency range to analyze
+data = {
+    "dexmedetomidine: 0.00045": [46, 47, 64, 88, 97, 101],
+    "dexmedetomidine: 0.0003": [40, 41, 48, 87, 93, 94],
+    "propofol": [36, 43, 44, 86, 99, 103],
+    "sleep": [35, 37, 38, 83, 90, 92],
+    "ketamine": [39, 42, 45, 85, 96, 112]
+}
+
+selections = { 
+    46:  [[1,20], [28.24, 75]], 
+    47:  [[1,20], [28.24, 75]],  
+    64:  [[4,17], [28.24, 75]], 
+    88:  [[1,8], [28.24, 83.24]],
+    97:  [[1,13], [28.24, 83.24]], 
+    101:  [[1,25], [37, 90]],
+    
+    40:  [[8,20], [55, 75]], 
+    41:  [[10,19], [60, 68]],
+    48:  [[1,20], [25, 35]],
+    87:  [[5,13], [73, 85]],
+    93:  [[18,28], [75, 95]],
+    94:  [[1,20], [75, 90]] , 
+    
+    36:  [[1,11], [55, 67]],
+    43:  [[15, 20], [40, 60]], 
+    44:  [[0,21], [40, 65]],
+    86:  [[5,16], [33, 65]],
+    99:  [[0,19], [33, 45]],
+    103:  [[1,17], [38, 65]], 
+    
+    35:  [[1,20], [28.24, 83.24]], 
+    37:  [[1,20], [28.24, 83.24]], 
+    38:  [[1,20], [28.24, 83.24]],
+    83:  [[1,20], [28.24, 83.24]],
+    90:  [[1,20], [28.24, 83.24]], 
+    92:  [[1,20], [28.24, 83.24]], 
+    
+    39:  [[10,20], [38, 50]], 
+    42:  [[1,20], [40, 51]], 
+    45:  [[1,15], [40, 60]], 
+    85:  [[14,24], [30, 50]], 
+    96:  [[1,12], [38, 55]],
+    112:  [[1,10], [40, 60]]
+}
+
+# Create a reverse mapping from numbers to drug types
+number_to_drug = {num: drug for drug, numbers in data.items() for num in numbers}
+
+#These times in minutes are filled in automatically in load_experiment
+drug_infusion_start = {}
+
+
+#%% Load experiment 
+def load_experiment(line_num, calcium_signal_filepath=None):
+    print('Loading Ephys to Calcium Coherence Analysis...')
+    
+    #load miniscope data
+    miniscope_data_manager = MiniscopeDataManager(line_num=line_num, filenames=[], auto_import_data=False)
+    metadata = miniscope_data_manager._get_miniscope_metadata()
+    if metadata: # fr defaults to 30fps if you don't have any miniscope experiments downloaded with metaData.json files in them
+        miniscope_data_manager.metadata.update(metadata)
+        fr = miniscope_data_manager.metadata['frameRate']
+    else:
+        fr = 30
+    
+    #load ephys data
+    ephys_api = EphysAPI()
+    ephys_api.run(line_num, channel_name=channel, remove_artifacts = False, filter_type = None, 
+                  filter_range = [0.5, 4], plot_channel = False, plot_spectrogram = False, plot_phases = False, logging_level = "CRITICAL")
+    channel_object = ephys_api.ephys_data_manager.get_channel(channel_name=channel)
+    
+    #updates drug_infusion_start above with when the anesthesia starts to be administered
+    print()
+    if number_to_drug[line_num] != 'sleep':
+        for idx, label in enumerate(channel_object.events['labels']):
+            if 'heat' in label:
+                print(f"This is what it thinks the start drug time label is: {label}")
+                start_time = channel_object.events['timestamps'][idx]
+                drug_infusion_start[line_num] = start_time
+                break
+    
+    
+    #sync timestamps
+    tCaIm, low_confidence_periods, channel_object, miniscope_data_manager = sync_neuralynx_miniscope_timestamps(channel_object, miniscope_data_manager, delete_TTLs=True, 
+                                                                                               fix_TTL_gaps=True, only_experiment_events=True)
+    ephys_idx_all_TTL_events, ephys_idx_ca_events = find_ephys_idx_of_TTL_events(tCaIm, channel=channel_object, frame_rate=fr, ca_events_idx=None, all_TTL_events=True)
+    channel_object.signal = channel_object.signal[ephys_idx_all_TTL_events] # downsample
+    
+    channel_object.sampling_rate = np.array(fr)
+    if calcium_signal_filepath:
+        miniscope_data_manager.mean_fluorescence_dict = np.load(calcium_signal_filepath)
+
+    if np.any(np.isnan(channel_object.signal)):
+        print(f"Line {line_num}: Replacing NaNs in EEG with zeros...")
+        channel_object.signal = np.nan_to_num(channel_object.signal, nan=0.0)
+    
+    return channel_object, miniscope_data_manager, fr
+    
+
+#%% Plot lines
+WIDTH = 0.5
+
+def plot_lines_ax(line_num, ax):
+    "The two functions in this cell help to draw lines on graphs to mark different events"
+    
+    a = ax.axvline(x=selections[line_num][0][0], color='red', linestyle='--', linewidth=WIDTH)
+    ax.axvline(x=selections[line_num][0][0] + 0.33, color='red', linestyle='--', linewidth=WIDTH)
+    x = ax.axvline(x=selections[line_num][0][1], color='red', linestyle='--', linewidth=WIDTH)
+    ax.axvline(x=selections[line_num][0][1] + 0.33, color='red', linestyle='--', linewidth=WIDTH)
+    
+    b = ax.axvline(x=selections[line_num][1][0], color='orange', linestyle='--', linewidth=WIDTH)
+    ax.axvline(x=selections[line_num][1][0] + 0.33, color='orange', linestyle='--', linewidth=WIDTH)
+    y = ax.axvline(x=selections[line_num][1][1], color='orange', linestyle='--', linewidth=WIDTH)
+    ax.axvline(x=selections[line_num][1][1] + 0.33, color='orange', linestyle='--', linewidth=WIDTH)
+    
+    if number_to_drug[line_num] != 'sleep':
+        c =  ax.axvline(x=drug_infusion_start[line_num]/60, color='red', linestyle='-', linewidth=1)
+        ax.axvline(x=drug_infusion_start[line_num]/60, color='red', linestyle='-', linewidth=1)
+        ax.legend([a, b, c], ['Control', 'Treatment', 'Start of Drug Infusion'])
+    else:
+        ax.legend([a, b], ['Control', 'Treatment'])
+
+def plot_lines_plt(line_num, plt):
+    a = plt.axvline(x=selections[line_num][0][0], color='red', linestyle='--', linewidth=WIDTH)
+    plt.axvline(x=selections[line_num][0][0] + 0.33, color='red', linestyle='--', linewidth=WIDTH)
+    x = plt.axvline(x=selections[line_num][0][1], color='red', linestyle='--', linewidth=WIDTH)
+    plt.axvline(x=selections[line_num][0][1] + 0.33, color='red', linestyle='--', linewidth=WIDTH)
+    
+    b = plt.axvline(x=selections[line_num][1][0], color='orange', linestyle='--', linewidth=WIDTH)
+    plt.axvline(x=selections[line_num][1][0] + 0.33, color='orange', linestyle='--', linewidth=WIDTH)
+    b = plt.axvline(x=selections[line_num][1][1], color='orange', linestyle='--', linewidth=WIDTH)
+    plt.axvline(x=selections[line_num][1][1] + 0.33, color='orange', linestyle='--', linewidth=WIDTH)
+    
+    if number_to_drug[line_num] != 'sleep':
+        c =  plt.axvline(x=drug_infusion_start[line_num]/60, color='red', linestyle='-', linewidth=1)
+        plt.axvline(x=drug_infusion_start[line_num]/60, color='red', linestyle='-', linewidth=1)
+        plt.legend([a, b, c], ['Control', 'Treatment', 'Start of Drug Infusion'])
+    else:
+        plt.legend([a, b], ['Control', 'Treatment'])
+ 
+
+    
+    
+#%% Plot Coherogram
+    
+def plot_coherogram(line_num, drug, eeg_signal, calcium_signal, fr): 
+    """Plots the coherogram of two signals"""
+    
+    # Define the spectrogram parameters
+    windowLength = 5  # in seconds
+    windowStep = 2.5  # in seconds
+    
+    # Compute the overlap ratio
+    overlap_ratio = 1 - (windowStep / windowLength)
+    
+    # Convert time coordinates to minutes
+    eeg_data = xr.DataArray(
+        eeg_signal,
+        dims=["time"],
+        coords={"time": np.arange(len(eeg_signal)) / (fr * 60)}  # Convert to minutes
+    )
+    calcium_data = xr.DataArray(
+        calcium_signal,
+        dims=["time"],
+        coords={"time": np.arange(len(calcium_signal)) / (fr * 60)}  # Convert to minutes
+    )
+    
+    # Compute the coherogram
+    coh = coherogram(
+        eeg_data,
+        calcium_data,
+        fs=fr,  # Sampling frequency
+        seglen=windowLength,  # Match spectrogram's window length
+        overlap_ratio=overlap_ratio,  # Calculated overlap ratio
+        nrolling=8,  # Rolling average over 8 FFT windows
+        window="hann"  # Hann window
+    )
+    
+    coh["time"] = coh["time"] / 60
+    
+    # Use imshow for plotting the coherogram
+    coh_magnitude = abs(coh) ** 2  # Coherence magnitude squared
+    im = coh_magnitude.plot.imshow(
+        cmap="viridis", 
+        robust=False,  # Disable automatic color scaling
+        vmin=0, vmax=0.7,  # Fix the color range to [0, 0.7]
+        figsize=(10, 6)  # Set figure size here instead
+    )
+    
+    # Get the current axis and figure after creating the plot
+    fig = plt.gcf()
+    ax = plt.gca()
+    
+    # Increase tick label size
+    ax.tick_params(axis='both', which='major', labelsize=20)
+    
+    # Update the color bar label
+    colorbar = im.colorbar
+    colorbar.ax.tick_params(labelsize=20)  # Increase colorbar tick label size
+    # colorbar.set_label("Coherence", fontsize=36)
+    
+    # Add title and axis labels
+    # ax.set_title(f"Coherogram", fontsize=36)
+    ax.set_xlabel("Time (minutes)", fontsize=24)
+    ax.set_ylabel("Frequency (Hz)", fontsize=24)
+    
+    # Plot lines using the axis version
+    plot_lines_ax(line_num, ax)
+    
+    plt.tight_layout()
+    
+    safe_drug_name = drug.replace(":", "_").replace(" ", "_").replace("/", "_").replace("\\", "_")
+    
+    # Save before showing
+    save_path = r"C:\Users\Path\To\Results"
+    os.makedirs(save_path, exist_ok=True)
+    svg_path = os.path.join(save_path, f"coherogram_{safe_drug_name}_line_{line_num}.svg")
+    
+    try:
+        # Verify figure object before saving
+        print(f"Attempting to save - Figure: {type(fig)}, Has {len(fig.axes)} axes")
+        
+        fig.savefig(svg_path, format='svg', bbox_inches='tight', dpi=300)
+        
+        # Verify the file was actually created and has content
+        if os.path.exists(svg_path):
+            actual_size = os.path.getsize(svg_path)
+            print(f"Successfully saved coherogram: {svg_path}")
+            print(f"File size: {actual_size:,} bytes")
+            
+            if actual_size == 0:
+                print(f"WARNING: File was created but has 0 bytes!")
+        else:
+            print(f"ERROR: File was not created at {svg_path}")
+            
+    except Exception as e:
+        print(f"Error saving coherogram: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    plt.show()
+    plt.close(fig)
+    
+    
+#%%
+
+def compute_stats(eeg_signal, calcium_signal, line, exp_type, fr):
+    """High level function that computes the various statistics of our two signals"""
+    
+    eeg_power = compute_power(line, fr, eeg_signal, windowLength=60, plotSpectrogram=False)
+    calcium_power = compute_power(line, fr, calcium_signal, windowLength=60, plotSpectrogram=False)
+    xc, lag, abs_xc, abs_lag = compute_xc(eeg_signal, calcium_signal, line, exp_type, fr)
+    coherence = compute_coherence(eeg_signal, calcium_signal, fr)
+    return [eeg_power, calcium_power, coherence, xc, lag]
+
+
+
+
+
+
+#%%
+def plot_signal_with_slices(signal, line_num, title="No title"):
+    """This function plots the full signal with the slices in selections shaded with red and blue"""
+    
+    # Slice the signal into control and treatment segments
+    sliced_control, sliced_treatment = slice_signal(signal, line_num, fr)
+    
+    # Create time arrays for plotting (in minutes)
+    total_samples = len(signal)
+    time_full = np.arange(total_samples) / (fr * 60)  # Convert samples to minutes
+    
+    # Get the start and end indices for control and treatment from slice_signal
+    control_start_idx = int(selections[line_num][0][0] * fr * 60)  # Start of control (samples)
+    control_end_idx = int(selections[line_num][0][1] * fr * 60)    # End of control (samples)
+    treatment_start_idx = int(selections[line_num][1][0] * fr * 60) # Start of treatment (samples)
+    treatment_end_idx = int(selections[line_num][1][1] * fr * 60)   # End of treatment (samples)
+    
+    # Create time arrays for control and treatment segments
+    time_control = np.arange(control_start_idx, control_end_idx) / (fr * 60)  # Time for control segment
+    time_treatment = np.arange(treatment_start_idx, treatment_end_idx) / (fr * 60)  # Time for treatment segment
+    
+    # Create the plot
+    plt.figure(figsize=(12, 6))
+    
+    # Plot the original signal
+    plt.plot(time_full, signal, color='gray', label='Original Signal', alpha=0.5)
+    
+    # Overlay the control segment
+    plt.plot(time_control, sliced_control, color='blue', label='Control Segment', linewidth=2)
+    
+    # Overlay the treatment segment
+    plt.plot(time_treatment, sliced_treatment, color='red', label='Treatment Segment', linewidth=2)
+    
+    # Add labels, title, and legend
+    plt.xlabel('Time (minutes)', fontsize=24)
+    plt.ylabel('Signal Amplitude', fontsize=24)
+    # plt.title(f'{title} Signal with Control and Treatment Segments (Line {line_num})')
+    plt.legend()
+    plt.grid(True)
+    
+    # Save as SVG
+    save_path = r"C:\Users\Path\To\Results"
+    os.makedirs(save_path, exist_ok=True)
+    plt.savefig(os.path.join(save_path, f"signal_{title}_line_{line_num}.svg"), format='svg', bbox_inches='tight')
+    
+    # Show the plot
+    plt.show()
+
+
+
+def slice_signal(signal, line_num, fr):
+    """
+    Slices the signal into control and treatment segments based on time ranges.
+    """
+
+    # Determine start indices for control and treatment
+    control_start_idx = int(selections[line_num][0][0] * fr * 60)
+    control_end_idx = int(selections[line_num][0][1] * fr * 60)
+    treatment_start_idx = int(selections[line_num][1][0] * fr * 60)
+    treatment_end_idx = int(selections[line_num][1][1] * fr * 60)
+    
+    # Extract slices from the signal
+    sliced_control = signal[control_start_idx:control_end_idx]
+    sliced_treatment = signal[treatment_start_idx:treatment_end_idx]
+    
+    return sliced_control, sliced_treatment
+
+#%%
+
+
+def align_signals(signal1, signal2, lag, fr):
+    """
+    Aligns two signals based on a given lag.
+    """
+    shift_samples = int(lag * fr)
+    
+    if shift_samples > 0:
+        aligned_signal1 = signal1[shift_samples:]  # Shift signal2 forward
+        aligned_signal2 = signal2[:-shift_samples]
+    elif shift_samples < 0:
+        aligned_signal1 = signal1[:shift_samples]  # Shift signal1 forward
+        aligned_signal2 = signal2[-shift_samples:]
+    else:
+        aligned_signal1 = signal1
+        aligned_signal2 = signal2
+
+    return aligned_signal1, aligned_signal2
+
+
+def compute_coherence(signal1, signal2, fr):
+    """
+    Computes coherence between two signals after aligning them by an ideal lag.
+    """
+    
+    # Compute coherence using Welch's method
+    f, Cxy = coherence(signal1, signal2, fs=fr)
+    
+    freq_indices = np.where((f >= CUT[0]) & (f <= CUT[1]))[0]
+    
+    Cxy = Cxy[freq_indices]
+    mean_coherence = np.mean(Cxy)
+    
+    return mean_coherence
+
+
+#%%
+
+
+def compute_xc(eeg_signal, calcium_signal, line, exp_type, fr, plot=True):
+    print(f"line: {line}, exp_type: {exp_type}")
+
+    """
+    Plots the cross-correlation between EEG and calcium signals.
+    """
+
+    # normalize    
+    norm_eeg = (eeg_signal - np.mean(eeg_signal)) / (np.std(eeg_signal)*len(eeg_signal))
+    norm_calcium = (calcium_signal - np.mean(calcium_signal)) / np.std(calcium_signal)
+    
+    # Compute the cross-correlation and normalize by length
+    nxcorr = correlate(norm_eeg, norm_calcium, mode='full')
+    
+    # Calculate the lags in seconds
+    lags = correlation_lags(len(norm_eeg), len(norm_calcium), mode='full') / fr
+    
+    max_display_lag = 10  # in seconds
+    lag_mask = (lags >= -max_display_lag) & (lags <= max_display_lag)
+    lags = lags[lag_mask]
+    nxcorr = nxcorr[lag_mask]
+    
+    # Find the maximum absolute cross-correlation and the lag at that point
+    max_xc = nxcorr[np.argmax(nxcorr)]
+    lag_at_max_xc = lags[np.argmax(nxcorr)]
+    
+    abs_xc = nxcorr[np.argmax(np.abs(nxcorr))]
+    lag_at_abs_xc = lags[np.argmax(np.abs(nxcorr))]
+    
+    if plot:
+        # Plot the cross-correlation
+        plt.figure(figsize=(10, 6))
+        plt.plot(lags, nxcorr)
+        
+        # Mark the lag at maximum cross-correlation
+        plt.axvline(x=lag_at_max_xc, color='red', linestyle='--', 
+                    label=f'Max Corr at {lag_at_max_xc:.2f} sec')
+        
+        # Titles and labels
+        # plt.title(f"Cross-Correlation | Line {line} | {number_to_drug[line]} | {exp_type}")
+        plt.xlabel("Lag (seconds)", fontsize=24)
+        plt.ylabel("Cross-Correlation", fontsize=24)
+        plt.legend()
+        plt.grid(True)
+        
+        # Set axis limits
+        plt.xlim([-10, 10])  # Show 20 seconds total on x-axis
+        plt.ylim([-0.7, 0.7])  # Standardize y-axis scale
+        
+        # Save as SVG
+        save_path = r"C:\Users\ericm\Desktop\Correlation_poster\test_svg_save"
+        os.makedirs(save_path, exist_ok=True)
+        plt.savefig(os.path.join(save_path, f"xcorr_line_{line}_{exp_type}.svg"), format='svg', bbox_inches='tight')
+        
+        plt.show()
+
+        
+    return max_xc, lag_at_max_xc, abs_xc, lag_at_abs_xc
+    
+    
+    
+#%%
+
+
+def filter_frequency(eeg_signal, calcium_signal, fr, cut):
+    """
+    Apply bandpass filtering to fluorescence and ephys data.
+    """
+    filtered_calcium_signal = misc_functions.filterData(calcium_signal, n=2, cut=cut, ftype='butter', btype='bandpass', fs=fr)
+    filtered_eeg_signal = EphysDataManager._filter_data(data=eeg_signal, n=2, cut=cut, ftype='butter', fs=fr, btype='bandpass', bodePlot=False)
+    
+    return filtered_eeg_signal, filtered_calcium_signal
+
+    
+#%%
+
+
+def compute_power(line, fr, data=None, windowLength=30, windowStep=3, freqLims=[0,20], timeBandwidth=2, plotSpectrogram=True, plot_mean_power=False, title="No title"):
+    """Estimate (and plot) the multi-taper spectrogram (of the mean miniscope fluorescence). Developed with Mike Prerau's function."""
+    print('Computing spectrogram of average miniscope fluorescence...')
+    # Set spectrogram params
+    fs = fr
+    numTapers = timeBandwidth * 2 - 1
+    windowParams = [windowLength, windowStep]
+    minNfft = 0  # No minimum nfft
+    detrendOpt = 'constant'  # detrend each window by subtracting the average
+    multiprocess = True  # use multiprocessing
+    nJobs = 3  # use 3 cores in multiprocessing
+    weighting = 'unity'  # weight each taper at 1
+    plotOn = False  # plot spectrogram using multitaper_spectrogram()
+    returnFig = False  # do not return plotted spectrogram
+    climScale = False # do not auto-scale colormap
+    verbose = True  # print extra info
+    xyflip = False  # do not transpose spect output matrix
+    
+    # Compute the multitaper spectrogram and convert the output to decibels
+    power_matrix, times, frequencies = multitaper_spectrogram(data, fs, freqLims, timeBandwidth, numTapers, windowParams, minNfft, detrendOpt, multiprocess, nJobs, weighting, plotOn, returnFig, climScale, verbose, xyflip)
+    power_array = 10 * np.log10(power_matrix) # convert to decibels
+    
+    low_freq = 0.5
+    high_freq = 4.0
+    # Find indices corresponding to the desired frequency band
+    freq_indices = np.where((frequencies >= low_freq) & (frequencies <= high_freq))[0]
+    
+    # Slice the spectral power array for the desired frequency band
+    mean= 0
+    sliced_power_array = power_array[freq_indices]      
+    mean = np.mean(sliced_power_array)
+    
+    if plot_mean_power: 
+        plot_mean_power_across_time(sliced_power_array, times, line, title)
+    
+    # Plot the multitaper spectrogram
+    if plotSpectrogram:
+        h, ax = misc_functions.spectrogram(times/60, frequencies, power_array, xLabel='Time (min)')
+        
+        ax.tick_params(axis='both', which='major', labelsize=12)
+        
+        # REMOVE THIS LINE: plt.figure(figsize=(10,6))
+        
+        # Add title with line number and associated drug
+        drug = number_to_drug.get(line, "Unknown")
+            
+        # ax.set_title(f"{title} | Line Number: {line} | Drug: {drug}", fontsize=9)
+        
+        # Plot red lines using the mapping
+        plot_lines_ax(line, ax)
+        
+        plt.tight_layout()
+        
+        # Save as SVG using the figure handle 'h' that was returned
+        save_path = r"C:\Users\ericm\Desktop\Correlation_poster\test_svg_save"
+        os.makedirs(save_path, exist_ok=True)
+        h.savefig(os.path.join(save_path, f"spectrogram_{title}_line_{line}.svg"), format='svg', bbox_inches='tight')
+        
+        plt.show()  # Display the graph
+    
+    return float(mean)
+
+
+def plot_mean_power_across_time(sliced_power_array, times, line_num, title):
+    """Plot the mean power array with the sliced signals we will be taking overlapped
+    This function is called by the function above, as it needs the power matrix of the signal to be computed
+    """
+    mean_power_across_time = np.mean(sliced_power_array, axis=0)
+    
+    
+    # For spectrogram data, use time points to find closest indices
+    control_start_time = selections[line_num][0][0] * 60  # Convert minutes to seconds
+    control_end_time = selections[line_num][0][1] * 60    # Convert minutes to seconds
+    treatment_start_time = selections[line_num][1][0] * 60  # Convert minutes to seconds
+    treatment_end_time = selections[line_num][1][1] * 60    # Convert minutes to seconds
+    
+    # Find indices in spectrogram_times closest to the desired times
+    control_start_idx = np.argmin(np.abs(times - control_start_time))
+    control_end_idx = np.argmin(np.abs(times - control_end_time))
+    treatment_start_idx = np.argmin(np.abs(times - treatment_start_time))
+    treatment_end_idx = np.argmin(np.abs(times - treatment_end_time))
+
+    # Slice the signal into control and treatment segments
+    sliced_control = mean_power_across_time[control_start_idx:control_end_idx]
+    sliced_treatment = mean_power_across_time[treatment_start_idx:treatment_end_idx]
+    
+    # Create time arrays for plotting (in minutes)
+    time_full = times / 60  # Convert spectrogram times (in seconds) to minutes
+    
+    # Create time arrays for control and treatment segments
+    time_control = times[control_start_idx:control_end_idx] / 60  # Convert to minutes
+    time_treatment = times[treatment_start_idx:treatment_end_idx] / 60  # Convert to minutes
+    
+    # Create the plot
+    plt.figure(figsize=(12, 6))
+    
+    # Plot the original signal
+    plt.plot(time_full, mean_power_across_time, color='gray', label='Original Signal', alpha=0.5)
+    
+    # Overlay the control segment if not empty
+    if len(sliced_control) > 0 and len(time_control) > 0:
+        plt.plot(time_control, sliced_control, color='blue', label='Control Segment', linewidth=2)
+    else:
+        print(f"Warning: Control segment is empty for line {line_num}")
+    
+    # Overlay the treatment segment if not empty
+    if len(sliced_treatment) > 0 and len(time_treatment) > 0:
+        plt.plot(time_treatment, sliced_treatment, color='red', label='Treatment Segment', linewidth=2)
+    else:
+        print(f"Warning: Treatment segment is empty for line {line_num}")
+    
+    # Add labels, title, and legend
+    plt.xlabel('Time (minutes)', fontsize=24)
+    plt.ylabel('Signal Amplitude (dB)',fontsize=24)
+    # plt.title(f'{title} Signal of mean slow wave power (Line {line_num})')
+    # plt.legend()
+    plt.grid(True)
+    
+    # Save as SVG
+    save_path = r"C:\Users\ericm\Desktop\Correlation_poster\test_svg_save"
+    os.makedirs(save_path, exist_ok=True)
+    plt.savefig(os.path.join(save_path, f"mean_power_{title}_line_{line_num}.svg"), format='svg', bbox_inches='tight')
+    
+    # Show the plot
+    plt.show()
+    plt.close()
+    
+
+def compute_mean_std(df):
+    try:
+        result = df.groupby("Measurement")[["Control", "Treatment", "Ratio"]].agg(["mean", "std"]).reset_index()
+        result[('Ratio', 'mean')] = result[('Treatment', 'mean')] / result[('Control', 'mean')]
+    except:
+        result = None
+    return result
+
+
+#compute p-values with a wilcoxon test
+def add_p_values(df, averaged_df):
+    if df is None or averaged_df is None:
+        return None
+    
+    
+    # Create a dictionary to store p-values for each measurement
+    p_value_map = {}
+
+    # Group by Measurement to compute p-values for each measurement type
+    for measurement, group in df.groupby("Measurement"):
+        
+        # Skip p-value computation for 'Lag'
+        if measurement.lower() == "lag":
+            p_value_map[measurement] = np.nan # Assign NaN or a specific placeholder
+            continue # Move to the next measurement
+        
+        control = group["Control"].values
+        treatment = group["Treatment"].values
+
+        # Ensure there are enough paired samples and no NaN values
+        valid_pairs = ~np.isnan(control) & ~np.isnan(treatment)
+        control = control[valid_pairs]
+        treatment = treatment[valid_pairs]
+
+        if len(control) > 0 and len(treatment) > 0:
+            # Perform Wilcoxon signed-rank test
+            try:
+                stat, p_value = wilcoxon(control, treatment, zero_method='wilcox', correction=False)
+            except ValueError:
+                # Handle cases where all differences are zero, which wilcoxon can't handle
+                p_value = np.nan
+        else:
+            # If insufficient data, assign NaN
+            p_value = np.nan
+        p_value_map[measurement] = p_value
+    
+    # Map the computed p-values back to the averaged_df
+    averaged_df["P-value"] = averaged_df["Measurement"].map(p_value_map)
+    return averaged_df
+
+#%% main
+
+# Define the results directory
+results_dir = r"C:\Users\Path\To\Results"
+os.makedirs(results_dir, exist_ok=True)
+
+
+# Initialize data lists
+sleep_data, dex_30_data, dex_45_data, iso_data, prop_data, ketamine_data = [], [], [], [], [], []
+rows = ["EEG Power", "Calcium Power", "Coherence", "XC", "Lag"]
+
+for line in line_nums:
+    print(f'\nRunning line number: {line}')
+    drug = number_to_drug.get(line)
+    calcium_signal_filepath = f"C:/Users/ericm/Desktop/meanFluorescence/meanFluorescence_{str(line)}.npz"
+    channel_object, miniscope_data_manager, fr = load_experiment(line, calcium_signal_filepath)
+    
+    # Grab the signals
+    eeg_signal = channel_object.signal
+    calcium_signal = miniscope_data_manager.mean_fluorescence_dict['meanFluorescence']
+    
+    # Plot both entire signals with the slices that are stored in selections, overlapped
+    plot_signal_with_slices(eeg_signal, line, title="Ephys")
+    plot_signal_with_slices(calcium_signal, line, title="Miniscope")
+    
+    # Plot ephys spectrogram and mean power signal
+    compute_power(line, fr, channel_object.signal, plot_mean_power=True, title="Ephys")
+    # Plot just calcium spectrogram
+    compute_power(line, fr, calcium_signal, plot_mean_power=False, title="Miniscope")
+    # Plot coherence of both signals
+    plot_coherogram(line, drug, eeg_signal, calcium_signal, fr)
+    
+    # Slice signals into small segments to use for data analysis
+    control_eeg, treatment_eeg = slice_signal(eeg_signal, line, fr)
+    control_calcium, treatment_calcium = slice_signal(calcium_signal, line, fr)
+    
+    # Filter the control/treatment signals
+    filtered_control_eeg, filtered_control_calcium = filter_frequency(control_eeg, control_calcium, fr, cut=CUT)
+    filtered_treatment_eeg, filtered_treatment_calcium = filter_frequency(treatment_eeg, treatment_calcium, fr, cut=CUT)
+ 
+    
+    # Compute stats for control and treatment
+    control_list = compute_stats(filtered_control_eeg, filtered_control_calcium, line, "Control", fr)
+    treatment_list = compute_stats(filtered_treatment_eeg, filtered_treatment_calcium, line, "Treatment", fr)
+    
+    # Compute the ratio for each pair of control and treatment values    
+    ratios = []
+    
+    for control, treatment in zip(control_list, treatment_list):
+        if abs(control) < 1e-10:  # Use a small threshold instead of int(control)
+            ratios.append(np.nan)  # Use NaN for invalid ratios
+        else:
+            ratios.append(treatment / control)
+    
+    # Combine into a row with columns ["lineNum", "Control", "Treatment", "Ratio"]
+    combined_data = {
+        "line_num": [line] * len(rows),
+        "Measurement": rows,
+        "Control": control_list,
+        "Treatment": treatment_list,
+        "Ratio": ratios
+    }
+    
+    # Convert to DataFrame row format and append to appropriate list
+    row_df = pd.DataFrame(combined_data)
+    
+
+    if line in data["dexmedetomidine: 0.00045"]:
+        dex_45_data.append(row_df)
+    elif line in data["dexmedetomidine: 0.0003"]:
+        dex_30_data.append(row_df)
+    elif line in data['propofol']:
+        prop_data.append(row_df)
+    elif line in data['sleep']:
+        sleep_data.append(row_df)
+    elif line in data["ketamine"]:
+        ketamine_data.append(row_df)
+    else:
+        raise("Key error. Is this number correct?")
+        
+
+# Combine all rows into final DataFrames
+dex_45_df = pd.concat(dex_45_data, ignore_index=True) if dex_45_data else None
+dex_30_df = pd.concat(dex_30_data, ignore_index=True) if dex_30_data else None
+sleep_df = pd.concat(sleep_data, ignore_index=True) if sleep_data else None
+ketamine_df = pd.concat(ketamine_data, ignore_index=True) if ketamine_data else None
+prop_df = pd.concat(prop_data, ignore_index=True) if prop_data else None
+
+
+# Compute averaged DataFrames
+dex_45_avg_df = compute_mean_std(dex_45_df)
+dex_30_avg_df = compute_mean_std(dex_30_df)
+sleep_avg_df = compute_mean_std(sleep_df)
+ketamine_avg_df = compute_mean_std(ketamine_df)
+prop_avg_df = compute_mean_std(prop_df)
+
+
+# add p-values to each averaged dataframe
+dex_45_avg_df = add_p_values(dex_45_df, dex_45_avg_df)
+dex_30_avg_df = add_p_values(dex_30_df, dex_30_avg_df)
+sleep_avg_df = add_p_values(sleep_df, sleep_avg_df)
+ketamine_avg_df = add_p_values(ketamine_df, ketamine_avg_df)
+prop_avg_df = add_p_values(prop_df, prop_avg_df)
+
+print(f"Control: {control_list}, Treatment: {treatment_list}, Ratios: {ratios}")
+
+# Create directory for results if it doesn't exist
+results_dir = os.path.join(os.pardir, "Results")
+os.makedirs(results_dir, exist_ok=True)
+
+# Save DataFrames as CSV files
+def save_group(df, avg, name, channel):
+    """Save data without overwriting — includes channel in filename."""
+    if df is not None and avg is not None and not df.empty:
+        
+        safe_channel = channel.replace("/", "_").replace("\\", "_")  # sanitize
+        
+        df.to_csv(os.path.join(results_dir, f"{name}_{safe_channel}_data.csv"), index=False)
+        avg.to_csv(os.path.join(results_dir, f"{name}_{safe_channel}_avg_data.csv"), index=False)
+        
+        print(f"{name.capitalize()} data saved for channel: {channel}")
+    else:
+        print(f"{name.capitalize()} data not found or empty.")
+
+save_group(dex_45_df, dex_45_avg_df, "dex_45", channel)
+save_group(dex_30_df, dex_30_avg_df, "dex_30", channel)
+save_group(prop_df,   prop_avg_df,   "propofol", channel)
+save_group(sleep_df,  sleep_avg_df,  "sleep", channel)
+save_group(ketamine_df, ketamine_avg_df, "ketamine", channel)

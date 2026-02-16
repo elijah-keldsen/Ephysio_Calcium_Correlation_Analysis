@@ -1,0 +1,1840 @@
+"""
+EEG vs Calcium Fluorescence Scatter and Hexbin Plots (Improved Version)
+========================================================================
+Generates publication-quality scatter and hexbin plots showing the relationship
+between electrophysiology (EEG/LFP) and calcium imaging (fluorescence) signals.
+
+This script loads data directly from source using the same methodology as 
+coherence_analysis_ephys_calcium.py to ensure consistency and reproducibility.
+
+IMPROVEMENTS OVER ORIGINAL VERSION:
+-----------------------------------
+1. Symmetric normalization: Both EEG and calcium are z-scored after filtering
+2. Global normalization: Control and treatment use shared normalization parameters
+3. Filter edge trimming: Removes filter transient artifacts from signal edges
+4. Robust NaN handling: Interpolates short gaps, excludes long gaps
+5. Autocorrelation-corrected statistics: Reports effective N and confidence intervals
+6. Comprehensive parameter logging: Saves all analysis parameters for reproducibility
+7. Enhanced figure annotations: Includes CI and effective sample size
+
+For each subject, generates 6 figures:
+1. Control period - Scatter plot
+2. Control period - Hexbin plot
+3. Treatment period - Scatter plot
+4. Treatment period - Hexbin plot
+5. Combined (control + treatment) - Scatter plot
+6. Combined (control + treatment) - Hexbin plot
+
+Journal Requirements Implemented (eNeuro):
+- Single column width: 8.5 cm (3.35 inches)
+- 300 dpi minimum for grayscale
+- RGB format for color, saved as TIFF and EPS
+- No top/right spines (no boxed panels)
+- Grayscale-friendly with texture/marker differentiation
+- Colorblind accessible (no red-green combinations)
+
+Methodological Note:
+-------------------
+This analysis differs from Tort-Colet et al. (2023) in several key ways:
+- Recording configuration: Differential EEG (PFC-Cerebellum) vs local LFP
+- Anatomical relationship: Cross-regional vs same-site recordings  
+- Filter bands: 0.5-4 Hz for both signals vs 10-15 Hz (LFP) / 0.1-1.5 Hz (calcium)
+- Scientific question: Slow-wave dynamics vs local activity coupling
+
+These differences justify the observed negative correlations under dexmedetomidine
+as a legitimate finding about cortico-cerebellar coupling, not a methodological artifact.
+"""
+
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+import json
+import scipy
+from datetime import datetime
+from scipy.stats import pearsonr, t as t_dist
+from scipy.signal import butter, filtfilt
+from typing import Tuple, Optional, Dict, List
+
+# Import the same modules used in coherence_analysis_ephys_calcium.py
+from src import misc_functions
+from src2.miniscope.miniscope_data_manager import MiniscopeDataManager
+from src2.ephys.ephys_api import EphysAPI
+from src2.ephys.ephys_data_manager import EphysDataManager
+from src2.multimodal.miniscope_ephys_alignment_utils import (
+    sync_neuralynx_miniscope_timestamps, 
+    find_ephys_idx_of_TTL_events
+)
+
+
+# ============================================================================
+# EXPERIMENTAL METADATA
+# ============================================================================
+
+# Drug groups with their subject line numbers
+data = {
+    "dexmedetomidine: 0.00045": [46, 47, 64, 88, 97, 101],
+    "dexmedetomidine: 0.0003": [40, 41, 48, 87, 93, 94],
+    "propofol": [36, 43, 44, 86, 99, 103],
+    "sleep": [35, 37, 38, 83, 90, 92],
+    "ketamine": [39, 42, 45, 85, 96, 112]
+}
+
+# Time range mapping for each line number (in minutes)
+# Format: [[control_start, control_end], [treatment_start, treatment_end]]
+selections = { 
+    46:  [[1,20], [28.24, 75]], 
+    47:  [[1,20], [28.24, 75]],  
+    64:  [[4,17], [28.24, 75]], 
+    88:  [[1,8], [28.24, 83.24]],
+    97:  [[1,13], [28.24, 83.24]], 
+    101: [[1,25], [37, 90]],
+    
+    40:  [[8,20], [55, 75]], 
+    41:  [[10,19], [60, 68]],
+    48:  [[1,20], [25, 35]],
+    87:  [[5,13], [73, 85]],
+    93:  [[18,28], [75, 95]],
+    94:  [[1,20], [75, 90]], 
+    
+    36:  [[1,11], [55, 67]],
+    43:  [[15, 20], [40, 60]], 
+    44:  [[0,21], [40, 65]],
+    86:  [[5,16], [33, 65]],
+    99:  [[0,19], [33, 45]],
+    103: [[1,17], [38, 65]], 
+    
+    35:  [[1,20], [28.24, 83.24]], 
+    37:  [[1,20], [28.24, 83.24]], 
+    38:  [[1,20], [28.24, 83.24]],
+    83:  [[1,20], [28.24, 83.24]],
+    90:  [[1,20], [28.24, 83.24]], 
+    92:  [[1,20], [28.24, 83.24]], 
+    
+    39:  [[10,20], [38, 50]], 
+    42:  [[1,20], [40, 51]], 
+    45:  [[1,15], [40, 60]], 
+    85:  [[14,24], [30, 50]], 
+    96:  [[1,12], [38, 55]],
+    112: [[1,10], [40, 60]]
+}
+
+# Create reverse mapping from line numbers to drug types
+number_to_drug = {num: drug for drug, numbers in data.items() for num in numbers}
+
+# Drug infusion start times (populated during load_experiment)
+drug_infusion_start = {}
+
+
+# ============================================================================
+# SIGNAL PROCESSING CONFIGURATION
+# ============================================================================
+# Centralized configuration with scientific justification
+
+FILTER_CONFIG = {
+    'lowcut': 0.5,              # Hz - lower bound of bandpass
+    'highcut': 4.0,             # Hz - upper bound of bandpass  
+    'order': 2,                 # Butterworth filter order
+    'filter_type': 'butter',    # Filter type
+    'edge_trim_seconds': 5.0,   # Seconds to trim from each edge after filtering
+}
+
+# Justification: 0.5-4 Hz captures slow-wave/delta activity relevant to 
+# anesthetic-induced brain states. This differs from Tort-Colet et al. (2023)
+# who used 10-15 Hz for LFP and 0.1-1.5 Hz for calcium, as our scientific
+# question focuses on slow oscillation dynamics rather than local activity coupling.
+
+NORMALIZATION_CONFIG = {
+    'method': 'zscore',         # 'zscore', 'minmax', or 'none'
+    'global_normalization': True,  # Use same parameters for control and treatment
+}
+
+NAN_HANDLING_CONFIG = {
+    'max_interpolation_gap_seconds': 0.5,  # Interpolate gaps shorter than this
+    'interpolation_method': 'linear',       # 'linear' or 'zero'
+}
+
+STATISTICS_CONFIG = {
+    'correct_autocorrelation': True,  # Compute effective sample size
+    'confidence_level': 0.95,          # For confidence intervals
+    'max_acf_lags': 100,               # Maximum lags for autocorrelation estimation
+}
+
+
+# ============================================================================
+# DATA PATHS AND DISPLAY CONFIGURATION
+# ============================================================================
+
+CALCIUM_DATA_PATH = r"C:\Users\ericm\Desktop\meanFluorescence"
+
+# Channel descriptions for figure legends
+CHANNEL_DESCRIPTIONS = {
+    'CBvsPCEEG': 'Cerebellum vs Parietal Cortex EEG',
+    'PFCLFPvsCBEEG': 'Prefrontal Cortex LFP vs Cerebellum EEG',
+    'PFCEEGvsCBEEG': 'Prefrontal Cortex EEG vs Cerebellum EEG'
+}
+
+# Units
+UNITS = {
+    'calcium': 'z-score',  # Updated to reflect z-scoring
+    'eeg': 'z-score'       # Updated to reflect z-scoring
+}
+
+# Journal-compliant figure sizes (in inches)
+SINGLE_COLUMN_WIDTH = 3.35      # 8.5 cm
+
+# DPI settings
+COLOR_DPI = 300
+
+# Grayscale-friendly color palette (colorblind accessible)
+COLORS = {
+    'control': '#969696',        # Medium gray for control
+    'treatment': '#252525',      # Dark gray for treatment
+    'edge_color': '#000000',     # Black edges
+    'regression': '#000000',     # Black regression line
+    'regression_ctrl': '#666666',  # Gray for control regression
+    'regression_treat': '#000000', # Black for treatment regression
+}
+
+# Marker styles (different shapes for accessibility)
+MARKERS = {
+    'control': 'o',      # Circle
+    'treatment': 's',    # Square
+}
+
+# Font sizes (journal-appropriate)
+FONTS = {
+    'axis_label': 9,
+    'tick_label': 8,
+    'annotation': 7,
+    'title': 10,
+}
+
+# Output directory
+RESULTS_PATH = r"C:\Users\ericm\Desktop\Correlation_poster\EEG_Calcium_Scatter_Improved"
+
+# Script version for reproducibility tracking
+SCRIPT_VERSION = "2.0.0"
+
+
+# ============================================================================
+# DATA LOADING FUNCTIONS
+# ============================================================================
+
+def load_experiment(line_num: int, channel: str, calcium_signal_filepath: str = None):
+    """
+    Load and synchronize ephys and calcium imaging data for a given subject.
+    
+    Parameters:
+    -----------
+    line_num : int
+        Subject line number
+    channel : str
+        EEG channel name
+    calcium_signal_filepath : str, optional
+        Path to pre-computed mean fluorescence file
+        
+    Returns:
+    --------
+    channel_object : object
+        Ephys channel with signal data
+    miniscope_data_manager : object
+        Miniscope data manager with calcium signal
+    fr : float
+        Sampling rate in Hz
+    """
+    print(f'  Loading data for line {line_num}...')
+    
+    # Load miniscope data
+    miniscope_data_manager = MiniscopeDataManager(
+        line_num=line_num, 
+        filenames=[], 
+        auto_import_data=False
+    )
+    metadata = miniscope_data_manager._get_miniscope_metadata()
+    
+    if metadata:
+        miniscope_data_manager.metadata.update(metadata)
+        fr = miniscope_data_manager.metadata['frameRate']
+    else:
+        fr = 30  # Default frame rate
+    
+    # Load ephys data
+    ephys_api = EphysAPI()
+    ephys_api.run(
+        line_num, 
+        channel_name=channel, 
+        remove_artifacts=False, 
+        filter_type=None,
+        filter_range=[FILTER_CONFIG['lowcut'], FILTER_CONFIG['highcut']], 
+        plot_channel=False, 
+        plot_spectrogram=False, 
+        plot_phases=False, 
+        logging_level="CRITICAL"
+    )
+    channel_object = ephys_api.ephys_data_manager.get_channel(channel_name=channel)
+    
+    # Extract drug infusion start time (for non-sleep experiments)
+    if number_to_drug[line_num] != 'sleep':
+        for idx, label in enumerate(channel_object.events['labels']):
+            if 'heat' in label:
+                start_time = channel_object.events['timestamps'][idx]
+                drug_infusion_start[line_num] = start_time
+                break
+    
+    # Sync timestamps between Neuralynx and miniscope
+    tCaIm, low_confidence_periods, channel_object, miniscope_data_manager = \
+        sync_neuralynx_miniscope_timestamps(
+            channel_object, 
+            miniscope_data_manager, 
+            delete_TTLs=True,
+            fix_TTL_gaps=True, 
+            only_experiment_events=True
+        )
+    
+    ephys_idx_all_TTL_events, ephys_idx_ca_events = find_ephys_idx_of_TTL_events(
+        tCaIm, 
+        channel=channel_object, 
+        frame_rate=fr, 
+        ca_events_idx=None, 
+        all_TTL_events=True
+    )
+    
+    # Downsample ephys to match miniscope frame rate
+    channel_object.signal = channel_object.signal[ephys_idx_all_TTL_events]
+    channel_object.sampling_rate = np.array(fr)
+    
+    # Load calcium signal from file
+    if calcium_signal_filepath:
+        miniscope_data_manager.mean_fluorescence_dict = np.load(calcium_signal_filepath)
+    
+    return channel_object, miniscope_data_manager, fr
+
+
+# ============================================================================
+# SIGNAL PROCESSING FUNCTIONS (IMPROVED)
+# ============================================================================
+
+def handle_nans(signal: np.ndarray, fr: float, 
+                max_gap_seconds: float = None) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Handle NaN values: interpolate short gaps, mark long gaps for exclusion.
+    
+    Parameters:
+    -----------
+    signal : np.ndarray
+        Input signal with potential NaN values
+    fr : float
+        Sampling rate in Hz
+    max_gap_seconds : float, optional
+        Maximum gap length to interpolate (default from config)
+        
+    Returns:
+    --------
+    signal_clean : np.ndarray
+        Signal with short gaps interpolated
+    valid_mask : np.ndarray
+        Boolean mask indicating valid (non-excluded) samples
+    """
+    if max_gap_seconds is None:
+        max_gap_seconds = NAN_HANDLING_CONFIG['max_interpolation_gap_seconds']
+    
+    nan_mask = np.isnan(signal)
+    if not np.any(nan_mask):
+        return signal.copy(), np.ones(len(signal), dtype=bool)
+    
+    max_gap_samples = int(max_gap_seconds * fr)
+    valid_mask = np.ones(len(signal), dtype=bool)
+    signal_clean = signal.copy()
+    
+    # Find contiguous NaN regions
+    nan_int = nan_mask.astype(int)
+    nan_diff = np.diff(np.concatenate([[0], nan_int, [0]]))
+    starts = np.where(nan_diff == 1)[0]
+    ends = np.where(nan_diff == -1)[0]
+    
+    for start, end in zip(starts, ends):
+        gap_length = end - start
+        
+        if gap_length <= max_gap_samples:
+            # Linear interpolation for short gaps
+            if start > 0 and end < len(signal):
+                interp_values = np.linspace(
+                    signal_clean[start - 1], 
+                    signal_clean[end] if end < len(signal) and not np.isnan(signal_clean[end]) else signal_clean[start - 1],
+                    gap_length + 2
+                )[1:-1]
+                signal_clean[start:end] = interp_values
+            elif start == 0 and end < len(signal):
+                # Gap at beginning - fill with first valid value
+                first_valid = signal_clean[end] if not np.isnan(signal_clean[end]) else 0
+                signal_clean[start:end] = first_valid
+            elif end >= len(signal) and start > 0:
+                # Gap at end - fill with last valid value
+                signal_clean[start:end] = signal_clean[start - 1]
+        else:
+            # Mark long gaps for exclusion
+            valid_mask[start:end] = False
+            # Still fill with zeros to avoid NaN propagation in filtering
+            signal_clean[start:end] = 0
+    
+    n_interpolated = np.sum(nan_mask) - np.sum(~valid_mask)
+    n_excluded = np.sum(~valid_mask)
+    
+    if n_interpolated > 0 or n_excluded > 0:
+        print(f"    NaN handling: {n_interpolated} samples interpolated, {n_excluded} samples excluded")
+    
+    return signal_clean, valid_mask
+
+
+def slice_signal(signal: np.ndarray, line_num: int, fr: float) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Slice signal into control and treatment segments based on time selections.
+    
+    Parameters:
+    -----------
+    signal : np.ndarray
+        Full recording signal
+    line_num : int
+        Subject line number (for looking up time windows)
+    fr : float
+        Sampling rate in Hz
+        
+    Returns:
+    --------
+    sliced_control : np.ndarray
+        Control period signal
+    sliced_treatment : np.ndarray
+        Treatment period signal
+    """
+    control_start_idx = int(selections[line_num][0][0] * fr * 60)
+    control_end_idx = int(selections[line_num][0][1] * fr * 60)
+    treatment_start_idx = int(selections[line_num][1][0] * fr * 60)
+    treatment_end_idx = int(selections[line_num][1][1] * fr * 60)
+    
+    sliced_control = signal[control_start_idx:control_end_idx]
+    sliced_treatment = signal[treatment_start_idx:treatment_end_idx]
+    
+    return sliced_control, sliced_treatment
+
+
+def filter_signal(signal: np.ndarray, fr: float, 
+                  lowcut: float = None, highcut: float = None,
+                  order: int = None) -> np.ndarray:
+    """
+    Apply Butterworth bandpass filter to a signal.
+    
+    Parameters:
+    -----------
+    signal : np.ndarray
+        Input signal
+    fr : float
+        Sampling rate in Hz
+    lowcut : float, optional
+        Lower cutoff frequency (default from config)
+    highcut : float, optional  
+        Upper cutoff frequency (default from config)
+    order : int, optional
+        Filter order (default from config)
+        
+    Returns:
+    --------
+    filtered : np.ndarray
+        Filtered signal
+    """
+    if lowcut is None:
+        lowcut = FILTER_CONFIG['lowcut']
+    if highcut is None:
+        highcut = FILTER_CONFIG['highcut']
+    if order is None:
+        order = FILTER_CONFIG['order']
+    
+    nyq = 0.5 * fr
+    low = lowcut / nyq
+    high = highcut / nyq
+    
+    b, a = butter(order, [low, high], btype='band')
+    filtered = filtfilt(b, a, signal)
+    
+    return filtered
+
+
+def trim_filter_edges(signal: np.ndarray, fr: float, 
+                      trim_seconds: float = None) -> np.ndarray:
+    """
+    Remove filter edge artifacts by trimming signal edges.
+    
+    Parameters:
+    -----------
+    signal : np.ndarray
+        Filtered signal
+    fr : float
+        Sampling rate in Hz
+    trim_seconds : float, optional
+        Seconds to trim from each edge (default from config)
+        
+    Returns:
+    --------
+    trimmed : np.ndarray
+        Signal with edges removed
+    """
+    if trim_seconds is None:
+        trim_seconds = FILTER_CONFIG['edge_trim_seconds']
+    
+    trim_samples = int(trim_seconds * fr)
+    
+    if 2 * trim_samples >= len(signal):
+        print(f"    WARNING: Signal too short for edge trimming, skipping")
+        return signal
+    
+    return signal[trim_samples:-trim_samples]
+
+
+def filter_and_trim(eeg_signal: np.ndarray, calcium_signal: np.ndarray, 
+                    fr: float) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Apply bandpass filtering and edge trimming to both signals.
+    
+    Parameters:
+    -----------
+    eeg_signal : np.ndarray
+        EEG signal
+    calcium_signal : np.ndarray
+        Calcium fluorescence signal
+    fr : float
+        Sampling rate in Hz
+        
+    Returns:
+    --------
+    filtered_eeg : np.ndarray
+        Filtered and trimmed EEG signal
+    filtered_calcium : np.ndarray
+        Filtered and trimmed calcium signal
+    """
+    # Filter both signals
+    filtered_eeg = filter_signal(eeg_signal, fr)
+    filtered_calcium = filter_signal(calcium_signal, fr)
+    
+    # Trim edges to remove filter artifacts
+    filtered_eeg = trim_filter_edges(filtered_eeg, fr)
+    filtered_calcium = trim_filter_edges(filtered_calcium, fr)
+    
+    return filtered_eeg, filtered_calcium
+
+
+def zscore_signal(signal: np.ndarray, mean: float = None, 
+                  std: float = None) -> Tuple[np.ndarray, float, float]:
+    """
+    Z-score normalize a signal.
+    
+    Parameters:
+    -----------
+    signal : np.ndarray
+        Input signal
+    mean : float, optional
+        Pre-computed mean (for global normalization)
+    std : float, optional
+        Pre-computed standard deviation (for global normalization)
+        
+    Returns:
+    --------
+    normalized : np.ndarray
+        Z-scored signal
+    mean : float
+        Mean used for normalization
+    std : float
+        Standard deviation used for normalization
+    """
+    valid_mask = ~np.isnan(signal)
+    
+    if not np.any(valid_mask):
+        return signal, np.nan, np.nan
+    
+    if mean is None:
+        mean = np.nanmean(signal)
+    if std is None:
+        std = np.nanstd(signal)
+    
+    if std == 0 or np.isnan(std):
+        return np.zeros_like(signal), mean, std
+    
+    normalized = (signal - mean) / std
+    
+    return normalized, mean, std
+
+
+def normalize_signals_global(control_eeg: np.ndarray, treatment_eeg: np.ndarray,
+                             control_calcium: np.ndarray, treatment_calcium: np.ndarray
+                             ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict]:
+    """
+    Normalize all signals using global (combined) parameters.
+    
+    This ensures that control and treatment periods are on the same scale,
+    making correlations directly comparable.
+    
+    Parameters:
+    -----------
+    control_eeg : np.ndarray
+        Control period EEG signal
+    treatment_eeg : np.ndarray
+        Treatment period EEG signal
+    control_calcium : np.ndarray
+        Control period calcium signal
+    treatment_calcium : np.ndarray
+        Treatment period calcium signal
+        
+    Returns:
+    --------
+    norm_control_eeg : np.ndarray
+        Normalized control EEG
+    norm_treatment_eeg : np.ndarray
+        Normalized treatment EEG
+    norm_control_calcium : np.ndarray
+        Normalized control calcium
+    norm_treatment_calcium : np.ndarray
+        Normalized treatment calcium
+    norm_params : dict
+        Normalization parameters used (for logging)
+    """
+    if NORMALIZATION_CONFIG['method'] == 'none':
+        return (control_eeg, treatment_eeg, control_calcium, treatment_calcium,
+                {'method': 'none'})
+    
+    if NORMALIZATION_CONFIG['global_normalization']:
+        # Compute global parameters across both periods
+        all_eeg = np.concatenate([control_eeg, treatment_eeg])
+        all_calcium = np.concatenate([control_calcium, treatment_calcium])
+        
+        eeg_mean = np.nanmean(all_eeg)
+        eeg_std = np.nanstd(all_eeg)
+        calcium_mean = np.nanmean(all_calcium)
+        calcium_std = np.nanstd(all_calcium)
+        
+        # Apply global normalization
+        norm_control_eeg, _, _ = zscore_signal(control_eeg, eeg_mean, eeg_std)
+        norm_treatment_eeg, _, _ = zscore_signal(treatment_eeg, eeg_mean, eeg_std)
+        norm_control_calcium, _, _ = zscore_signal(control_calcium, calcium_mean, calcium_std)
+        norm_treatment_calcium, _, _ = zscore_signal(treatment_calcium, calcium_mean, calcium_std)
+        
+        norm_params = {
+            'method': 'zscore',
+            'global': True,
+            'eeg_mean': eeg_mean,
+            'eeg_std': eeg_std,
+            'calcium_mean': calcium_mean,
+            'calcium_std': calcium_std
+        }
+    else:
+        # Normalize each period independently
+        norm_control_eeg, eeg_ctrl_mean, eeg_ctrl_std = zscore_signal(control_eeg)
+        norm_treatment_eeg, eeg_treat_mean, eeg_treat_std = zscore_signal(treatment_eeg)
+        norm_control_calcium, ca_ctrl_mean, ca_ctrl_std = zscore_signal(control_calcium)
+        norm_treatment_calcium, ca_treat_mean, ca_treat_std = zscore_signal(treatment_calcium)
+        
+        norm_params = {
+            'method': 'zscore',
+            'global': False,
+            'control_eeg_mean': eeg_ctrl_mean,
+            'control_eeg_std': eeg_ctrl_std,
+            'treatment_eeg_mean': eeg_treat_mean,
+            'treatment_eeg_std': eeg_treat_std,
+            'control_calcium_mean': ca_ctrl_mean,
+            'control_calcium_std': ca_ctrl_std,
+            'treatment_calcium_mean': ca_treat_mean,
+            'treatment_calcium_std': ca_treat_std
+        }
+    
+    return (norm_control_eeg, norm_treatment_eeg, 
+            norm_control_calcium, norm_treatment_calcium, norm_params)
+
+
+# ============================================================================
+# STATISTICS FUNCTIONS (IMPROVED)
+# ============================================================================
+
+def estimate_effective_sample_size(x: np.ndarray, y: np.ndarray, 
+                                   max_lags: int = None) -> float:
+    """
+    Estimate effective sample size accounting for autocorrelation.
+    
+    Uses Bartlett's formula approximation.
+    
+    Parameters:
+    -----------
+    x : np.ndarray
+        First signal
+    y : np.ndarray
+        Second signal
+    max_lags : int, optional
+        Maximum lags for ACF computation (default from config)
+        
+    Returns:
+    --------
+    n_effective : float
+        Effective sample size
+    """
+    if max_lags is None:
+        max_lags = STATISTICS_CONFIG['max_acf_lags']
+    
+    n = len(x)
+    max_lags = min(max_lags, n // 4)
+    
+    try:
+        from statsmodels.tsa.stattools import acf
+        
+        # Compute autocorrelation for both signals
+        acf_x = acf(x, nlags=max_lags, fft=True)
+        acf_y = acf(y, nlags=max_lags, fft=True)
+        
+        # Effective sample size correction (Bartlett's formula)
+        rho_sum = np.sum(acf_x[1:] * acf_y[1:])
+        n_effective = n / (1 + 2 * max(0, rho_sum))
+        
+        # Bound the result
+        n_effective = max(3, min(n_effective, n))
+        
+    except ImportError:
+        # Fallback if statsmodels not available
+        print("    Warning: statsmodels not available, using uncorrected N")
+        n_effective = n
+    
+    return n_effective
+
+
+def compute_confidence_interval(r: float, n_effective: float, 
+                                confidence: float = None) -> Tuple[float, float]:
+    """
+    Compute confidence interval for correlation using Fisher z-transform.
+    
+    Parameters:
+    -----------
+    r : float
+        Correlation coefficient
+    n_effective : float
+        Effective sample size
+    confidence : float, optional
+        Confidence level (default from config)
+        
+    Returns:
+    --------
+    ci_lower : float
+        Lower bound of confidence interval
+    ci_upper : float
+        Upper bound of confidence interval
+    """
+    if confidence is None:
+        confidence = STATISTICS_CONFIG['confidence_level']
+    
+    if n_effective <= 3 or np.isnan(r) or abs(r) >= 1:
+        return np.nan, np.nan
+    
+    # Fisher z-transform
+    z = np.arctanh(r)
+    se = 1.0 / np.sqrt(n_effective - 3)
+    
+    # Critical value for confidence interval
+    alpha = 1 - confidence
+    z_crit = scipy.stats.norm.ppf(1 - alpha / 2)
+    
+    # Confidence interval in z-space
+    z_lower = z - z_crit * se
+    z_upper = z + z_crit * se
+    
+    # Transform back to r-space
+    ci_lower = np.tanh(z_lower)
+    ci_upper = np.tanh(z_upper)
+    
+    return ci_lower, ci_upper
+
+
+def compute_statistics_robust(x: np.ndarray, y: np.ndarray, 
+                              fr: float = 30.0) -> Dict:
+    """
+    Compute correlation statistics with autocorrelation correction.
+    
+    Parameters:
+    -----------
+    x : np.ndarray
+        First signal (typically calcium)
+    y : np.ndarray
+        Second signal (typically EEG)
+    fr : float
+        Sampling rate in Hz (for context)
+        
+    Returns:
+    --------
+    stats : dict
+        Dictionary containing:
+        - n: raw sample size
+        - n_effective: autocorrelation-corrected sample size
+        - r: Pearson correlation coefficient
+        - p_value: uncorrected p-value
+        - p_value_corrected: p-value using effective N
+        - ci_lower, ci_upper: confidence interval bounds
+        - slope, intercept: linear regression parameters
+        - p_value_str: formatted p-value string
+    """
+    # Filter out NaN values
+    valid_mask = ~(np.isnan(x) | np.isnan(y))
+    x_valid = x[valid_mask]
+    y_valid = y[valid_mask]
+    
+    stats = {
+        'n': len(x_valid),
+        'n_effective': np.nan,
+        'r': np.nan,
+        'p_value': np.nan,
+        'p_value_corrected': np.nan,
+        'ci_lower': np.nan,
+        'ci_upper': np.nan,
+        'slope': np.nan,
+        'intercept': np.nan,
+        'p_value_str': 'N/A',
+        'p_value_corrected_str': 'N/A'
+    }
+    
+    if len(x_valid) < 10:
+        return stats
+    
+    # Basic correlation
+    r, p_value = pearsonr(x_valid, y_valid)
+    
+    # Linear regression
+    z = np.polyfit(x_valid, y_valid, 1)
+    
+    stats['r'] = r
+    stats['p_value'] = p_value
+    stats['slope'] = z[0]
+    stats['intercept'] = z[1]
+    
+    # Autocorrelation correction
+    if STATISTICS_CONFIG['correct_autocorrelation']:
+        n_effective = estimate_effective_sample_size(x_valid, y_valid)
+        stats['n_effective'] = int(n_effective)
+        
+        # Corrected p-value using effective N
+        if n_effective > 2:
+            t_stat = r * np.sqrt((n_effective - 2) / (1 - r**2 + 1e-10))
+            p_value_corrected = 2 * t_dist.sf(np.abs(t_stat), n_effective - 2)
+            stats['p_value_corrected'] = p_value_corrected
+        
+        # Confidence interval
+        ci_lower, ci_upper = compute_confidence_interval(r, n_effective)
+        stats['ci_lower'] = ci_lower
+        stats['ci_upper'] = ci_upper
+    else:
+        stats['n_effective'] = stats['n']
+        stats['p_value_corrected'] = p_value
+    
+    # Format p-value strings
+    stats['p_value_str'] = format_p_value(p_value)
+    stats['p_value_corrected_str'] = format_p_value(stats['p_value_corrected'])
+    
+    return stats
+
+
+def format_p_value(p: float) -> str:
+    """Format p-value for display."""
+    if np.isnan(p):
+        return "N/A"
+    elif p < 0.001:
+        return "p < 0.001"
+    elif p < 0.01:
+        return f"p = {p:.4f}"
+    elif p < 0.05:
+        return f"p = {p:.3f}"
+    else:
+        return f"p = {p:.3f}"
+
+
+# ============================================================================
+# FIGURE DESCRIPTION GENERATORS
+# ============================================================================
+
+def format_drug_name(drug: str) -> str:
+    """Format drug name for display in figure descriptions."""
+    if 'dexmedetomidine' in drug.lower():
+        dose = drug.split(': ')[1] if ': ' in drug else ''
+        return f"dexmedetomidine ({dose} mg/kg)" if dose else "dexmedetomidine"
+    elif drug.lower() == 'sleep':
+        return "natural sleep"
+    else:
+        return drug.lower()
+
+
+def generate_figure_description(
+    line_num: int,
+    channel: str,
+    drug: str,
+    period: str,
+    fr: float,
+    stats: Dict,
+    time_window: list,
+    plot_type: str = 'scatter'
+) -> str:
+    """
+    Generate an eNeuro-compliant figure description in paragraph format.
+    """
+    channel_desc = CHANNEL_DESCRIPTIONS.get(channel, channel)
+    drug_display = format_drug_name(drug)
+    
+    # Get statistics with safe defaults
+    n = stats.get('n', 0)
+    n_eff = stats.get('n_effective', n)
+    r = stats.get('r', float('nan'))
+    p_str = stats.get('p_value_corrected_str', stats.get('p_value_str', 'N/A'))
+    ci_lower = stats.get('ci_lower', float('nan'))
+    ci_upper = stats.get('ci_upper', float('nan'))
+    slope = stats.get('slope', float('nan'))
+    intercept = stats.get('intercept', float('nan'))
+    p_value = stats.get('p_value_corrected', stats.get('p_value', 1.0))
+    
+    # Determine correlation direction and significance
+    if not np.isnan(r):
+        corr_direction = "positive" if r > 0 else "negative"
+        corr_strength = "strong" if abs(r) > 0.5 else "moderate" if abs(r) > 0.3 else "weak"
+        significance = "significant" if p_value < 0.05 else "not statistically significant"
+    else:
+        corr_direction = "undetermined"
+        corr_strength = "undetermined"
+        significance = "undetermined"
+    
+    # CI string
+    if not np.isnan(ci_lower) and not np.isnan(ci_upper):
+        ci_str = f", 95% CI [{ci_lower:.3f}, {ci_upper:.3f}]"
+    else:
+        ci_str = ""
+    
+    filter_desc = f"{FILTER_CONFIG['lowcut']}-{FILTER_CONFIG['highcut']} Hz"
+    
+    if plot_type == 'hexbin':
+        description = f"""
+{'='*80}
+FIGURE DESCRIPTION - Subject {line_num} - {period} - Hexbin
+{'='*80}
+
+Relationship between electrophysiology and calcium fluorescence signals during the {period.lower()} period for Subject {line_num} ({drug_display}). Hexbin density plot showing the bivariate distribution of bandpass-filtered ({filter_desc}, {FILTER_CONFIG['order']}nd-order Butterworth) and z-scored EEG amplitude versus calcium fluorescence recorded from the {channel_desc} channel. Data were acquired at {fr:.1f} Hz and collected during minutes {time_window[0]:.2f}–{time_window[1]:.2f} of the recording session. Color intensity (plasma colormap) indicates the density of data points within each hexagonal bin. The dashed red line represents the linear regression fit (slope = {slope:.6f}, intercept = {intercept:.6f}). A {corr_strength} {corr_direction} correlation was observed between the two signals (r = {r:.4f}{ci_str}, {p_str}, n = {n:,} samples, n_effective = {n_eff:,}), which was {significance} at α = 0.05 after correction for temporal autocorrelation.
+
+{'='*80}
+"""
+    else:
+        description = f"""
+{'='*80}
+FIGURE DESCRIPTION - Subject {line_num} - {period} - Scatter
+{'='*80}
+
+Relationship between electrophysiology and calcium fluorescence signals during the {period.lower()} period for Subject {line_num} ({drug_display}). Scatter plot showing bandpass-filtered ({filter_desc}, {FILTER_CONFIG['order']}nd-order Butterworth) and z-scored EEG amplitude versus calcium fluorescence recorded from the {channel_desc} channel. Each point represents a single time sample acquired at {fr:.1f} Hz during minutes {time_window[0]:.2f}–{time_window[1]:.2f}. The dashed black line represents the linear regression fit (slope = {slope:.6f}, intercept = {intercept:.6f}). A {corr_strength} {corr_direction} correlation was observed (r = {r:.4f}{ci_str}, {p_str}, n = {n:,} samples, n_effective = {n_eff:,}), which was {significance} at α = 0.05 after correction for temporal autocorrelation.
+
+{'='*80}
+"""
+    
+    return description
+
+
+def generate_combined_figure_description(
+    line_num: int,
+    channel: str,
+    drug: str,
+    fr: float,
+    stats_control: Dict,
+    stats_treatment: Dict,
+    time_window_control: list,
+    time_window_treatment: list,
+    plot_type: str = 'scatter'
+) -> str:
+    """
+    Generate an eNeuro-compliant figure description for combined control/treatment plots.
+    """
+    channel_desc = CHANNEL_DESCRIPTIONS.get(channel, channel)
+    drug_display = format_drug_name(drug)
+    
+    # Get statistics with safe defaults
+    n_ctrl = stats_control.get('n', 0)
+    n_eff_ctrl = stats_control.get('n_effective', n_ctrl)
+    r_ctrl = stats_control.get('r', float('nan'))
+    p_str_ctrl = stats_control.get('p_value_corrected_str', 'N/A')
+    ci_lower_ctrl = stats_control.get('ci_lower', float('nan'))
+    ci_upper_ctrl = stats_control.get('ci_upper', float('nan'))
+    
+    n_treat = stats_treatment.get('n', 0)
+    n_eff_treat = stats_treatment.get('n_effective', n_treat)
+    r_treat = stats_treatment.get('r', float('nan'))
+    p_str_treat = stats_treatment.get('p_value_corrected_str', 'N/A')
+    ci_lower_treat = stats_treatment.get('ci_lower', float('nan'))
+    ci_upper_treat = stats_treatment.get('ci_upper', float('nan'))
+    
+    # CI strings
+    ci_str_ctrl = f" [{ci_lower_ctrl:.3f}, {ci_upper_ctrl:.3f}]" if not np.isnan(ci_lower_ctrl) else ""
+    ci_str_treat = f" [{ci_lower_treat:.3f}, {ci_upper_treat:.3f}]" if not np.isnan(ci_lower_treat) else ""
+    
+    # Calculate correlation change
+    if not (np.isnan(r_ctrl) or np.isnan(r_treat)):
+        r_change = r_treat - r_ctrl
+        change_direction = "increased" if r_change > 0 else "decreased"
+        change_descriptor = f"{change_direction} by {abs(r_change):.4f}"
+    else:
+        change_descriptor = "could not be determined"
+    
+    filter_desc = f"{FILTER_CONFIG['lowcut']}-{FILTER_CONFIG['highcut']} Hz"
+    
+    if plot_type == 'hexbin':
+        description = f"""
+{'='*80}
+FIGURE DESCRIPTION - Subject {line_num} - Combined - Hexbin
+{'='*80}
+
+Comparison of electrophysiology-calcium fluorescence relationships between control and treatment periods for Subject {line_num} ({drug_display}). Side-by-side hexbin density plots showing the bivariate distribution of bandpass-filtered ({filter_desc}) and z-scored EEG amplitude versus calcium fluorescence recorded from the {channel_desc} channel during control (left; minutes {time_window_control[0]:.2f}–{time_window_control[1]:.2f}) and treatment (right; minutes {time_window_treatment[0]:.2f}–{time_window_treatment[1]:.2f}) periods. Both periods were normalized using shared (global) z-score parameters to enable direct comparison. Control: r = {r_ctrl:.4f}{ci_str_ctrl}, {p_str_ctrl}, n_effective = {n_eff_ctrl:,}. Treatment: r = {r_treat:.4f}{ci_str_treat}, {p_str_treat}, n_effective = {n_eff_treat:,}. The correlation {change_descriptor} from control to treatment.
+
+{'='*80}
+"""
+    else:
+        description = f"""
+{'='*80}
+FIGURE DESCRIPTION - Subject {line_num} - Combined - Scatter
+{'='*80}
+
+Comparison of electrophysiology-calcium fluorescence relationships between control and treatment periods for Subject {line_num} ({drug_display}). Overlaid scatter plot showing bandpass-filtered ({filter_desc}) and z-scored signals from the {channel_desc} channel. Control (gray circles; minutes {time_window_control[0]:.2f}–{time_window_control[1]:.2f}) and treatment (black squares; minutes {time_window_treatment[0]:.2f}–{time_window_treatment[1]:.2f}) with respective regression fits. Both periods normalized using shared parameters. Control: r = {r_ctrl:.4f}{ci_str_ctrl}, {p_str_ctrl}, n_effective = {n_eff_ctrl:,}. Treatment: r = {r_treat:.4f}{ci_str_treat}, {p_str_treat}, n_effective = {n_eff_treat:,}. The correlation {change_descriptor} from control to treatment.
+
+{'='*80}
+"""
+    
+    return description
+
+
+# ============================================================================
+# PLOTTING FUNCTIONS (AESTHETICS PRESERVED)
+# ============================================================================
+
+def create_scatter_plot(
+    calcium_signal: np.ndarray,
+    eeg_signal: np.ndarray,
+    line_num: int,
+    condition: str,
+    period: str,
+    channel: str,
+    fr: float,
+    time_window: list,
+    save_path: Optional[str] = None
+) -> Tuple[plt.Figure, Dict]:
+    """
+    Create a scatter plot of EEG vs Calcium fluorescence.
+    """
+    fig, ax = plt.subplots(figsize=(SINGLE_COLUMN_WIDTH, SINGLE_COLUMN_WIDTH))
+    
+    # Determine color based on period
+    if period == 'Control':
+        color = COLORS['control']
+        marker = MARKERS['control']
+        alpha = 0.3
+    elif period == 'Treatment':
+        color = COLORS['treatment']
+        marker = MARKERS['treatment']
+        alpha = 0.3
+    else:
+        color = COLORS['control']
+        marker = MARKERS['control']
+        alpha = 0.2
+    
+    # Plot scatter
+    ax.scatter(calcium_signal, eeg_signal,
+               c=color,
+               marker=marker,
+               s=1,
+               alpha=alpha,
+               edgecolors='none',
+               rasterized=True)
+    
+    # Compute statistics
+    stats = compute_statistics_robust(calcium_signal, eeg_signal, fr)
+    
+    if stats['n'] > 2 and not np.isnan(stats['r']):
+        # Add regression line
+        valid_mask = ~(np.isnan(calcium_signal) | np.isnan(eeg_signal))
+        calcium_valid = calcium_signal[valid_mask]
+        
+        p = np.poly1d([stats['slope'], stats['intercept']])
+        x_line = np.linspace(np.min(calcium_valid), np.max(calcium_valid), 100)
+        ax.plot(x_line, p(x_line), 
+                color=COLORS['regression'], 
+                linestyle='--', 
+                linewidth=1,
+                label=f'r = {stats["r"]:.3f}')
+        
+        # Add statistical annotation (enhanced)
+        ci_str = ""
+        if not np.isnan(stats['ci_lower']):
+            ci_str = f"\n95% CI [{stats['ci_lower']:.2f}, {stats['ci_upper']:.2f}]"
+        
+        stats_text = (f"n = {stats['n']:,}\n"
+                      f"n_eff = {stats['n_effective']:,}\n"
+                      f"r = {stats['r']:.3f}{ci_str}\n"
+                      f"{stats['p_value_corrected_str']}")
+        
+        ax.text(0.02, 0.98, stats_text,
+               transform=ax.transAxes,
+               fontsize=FONTS['annotation'],
+               verticalalignment='top',
+               horizontalalignment='left',
+               bbox=dict(boxstyle='round',
+                        facecolor='white',
+                        edgecolor='black',
+                        linewidth=0.5,
+                        alpha=0.9))
+    
+    # Formatting
+    ax.set_xlabel(f'Calcium ({UNITS["calcium"]})', fontsize=FONTS['axis_label'])
+    ax.set_ylabel(f'EEG ({UNITS["eeg"]})', fontsize=FONTS['axis_label'])
+    ax.tick_params(axis='both', which='major', labelsize=FONTS['tick_label'])
+    
+    # Remove top and right spines
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    
+    # Add subtle grid
+    ax.grid(True, alpha=0.3, linewidth=0.5, linestyle=':')
+    ax.set_axisbelow(True)
+    
+    plt.tight_layout()
+    
+    # Save figures
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        
+        tiff_path = save_path if save_path.endswith('.tiff') else save_path + '.tiff'
+        fig.savefig(tiff_path, format='tiff', bbox_inches='tight', dpi=COLOR_DPI,
+                   pil_kwargs={'compression': 'tiff_lzw'})
+        print(f"    Saved TIFF: {tiff_path}")
+        
+        eps_path = tiff_path.replace('.tiff', '.eps')
+        fig.savefig(eps_path, format='eps', bbox_inches='tight', dpi=COLOR_DPI)
+        print(f"    Saved EPS: {eps_path}")
+        
+        svg_path = tiff_path.replace('.tiff', '.svg')
+        fig.savefig(svg_path, format='svg', bbox_inches='tight', dpi=COLOR_DPI)
+        print(f"    Saved SVG: {svg_path}")
+    
+    # Print figure description
+    description = generate_figure_description(
+        line_num, channel, condition, period, fr, stats, time_window, 'scatter'
+    )
+    print(description)
+    
+    plt.show()
+    plt.close(fig)
+    
+    return fig, stats
+
+
+def create_hexbin_plot(
+    calcium_signal: np.ndarray,
+    eeg_signal: np.ndarray,
+    line_num: int,
+    condition: str,
+    period: str,
+    channel: str,
+    fr: float,
+    time_window: list,
+    save_path: Optional[str] = None
+) -> Tuple[plt.Figure, Dict]:
+    """
+    Create a hexbin plot of EEG vs Calcium fluorescence with plasma colormap.
+    """
+    fig, ax = plt.subplots(figsize=(SINGLE_COLUMN_WIDTH, SINGLE_COLUMN_WIDTH))
+    
+    # Compute statistics
+    stats = compute_statistics_robust(calcium_signal, eeg_signal, fr)
+    
+    # Filter out NaN values
+    valid_mask = ~(np.isnan(calcium_signal) | np.isnan(eeg_signal))
+    calcium_valid = calcium_signal[valid_mask]
+    eeg_valid = eeg_signal[valid_mask]
+    
+    if len(calcium_valid) < 10:
+        print(f"    WARNING: Not enough valid data points for hexbin plot")
+        plt.close(fig)
+        return fig, stats
+    
+    # Create hexbin plot with plasma colormap
+    hb = ax.hexbin(calcium_valid, eeg_valid,
+                   gridsize=50,
+                   cmap='plasma',
+                   mincnt=1,
+                   edgecolors='none')
+    
+    # Add colorbar
+    cb = fig.colorbar(hb, ax=ax)
+    cb.set_label('Count', fontsize=FONTS['axis_label'])
+    cb.ax.tick_params(labelsize=FONTS['tick_label'])
+    
+    if stats['n'] > 2 and not np.isnan(stats['r']):
+        # Add regression line
+        p = np.poly1d([stats['slope'], stats['intercept']])
+        x_line = np.linspace(np.min(calcium_valid), np.max(calcium_valid), 100)
+        ax.plot(x_line, p(x_line), 
+                color='red',
+                linestyle='--', 
+                linewidth=1.5,
+                label=f'r = {stats["r"]:.3f}')
+        
+        # Add statistical annotation (enhanced)
+        ci_str = ""
+        if not np.isnan(stats['ci_lower']):
+            ci_str = f"\n95% CI [{stats['ci_lower']:.2f}, {stats['ci_upper']:.2f}]"
+        
+        stats_text = (f"n = {stats['n']:,}\n"
+                      f"n_eff = {stats['n_effective']:,}\n"
+                      f"r = {stats['r']:.3f}{ci_str}\n"
+                      f"{stats['p_value_corrected_str']}")
+        
+        ax.text(0.02, 0.98, stats_text,
+               transform=ax.transAxes,
+               fontsize=FONTS['annotation'],
+               verticalalignment='top',
+               horizontalalignment='left',
+               bbox=dict(boxstyle='round',
+                        facecolor='white',
+                        edgecolor='black',
+                        linewidth=0.5,
+                        alpha=0.9))
+    
+    # Formatting
+    ax.set_xlabel(f'Calcium ({UNITS["calcium"]})', fontsize=FONTS['axis_label'])
+    ax.set_ylabel(f'EEG ({UNITS["eeg"]})', fontsize=FONTS['axis_label'])
+    ax.tick_params(axis='both', which='major', labelsize=FONTS['tick_label'])
+    
+    # Remove top and right spines
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    
+    plt.tight_layout()
+    
+    # Save figures
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        
+        tiff_path = save_path if save_path.endswith('.tiff') else save_path + '.tiff'
+        fig.savefig(tiff_path, format='tiff', bbox_inches='tight', dpi=COLOR_DPI,
+                   pil_kwargs={'compression': 'tiff_lzw'})
+        print(f"    Saved TIFF: {tiff_path}")
+        
+        eps_path = tiff_path.replace('.tiff', '.eps')
+        fig.savefig(eps_path, format='eps', bbox_inches='tight', dpi=COLOR_DPI)
+        print(f"    Saved EPS: {eps_path}")
+        
+        svg_path = tiff_path.replace('.tiff', '.svg')
+        fig.savefig(svg_path, format='svg', bbox_inches='tight', dpi=COLOR_DPI)
+        print(f"    Saved SVG: {svg_path}")
+    
+    # Print figure description
+    description = generate_figure_description(
+        line_num, channel, condition, period, fr, stats, time_window, 'hexbin'
+    )
+    print(description)
+    
+    plt.show()
+    plt.close(fig)
+    
+    return fig, stats
+
+
+def create_combined_scatter_plot(
+    calcium_control: np.ndarray,
+    eeg_control: np.ndarray,
+    calcium_treatment: np.ndarray,
+    eeg_treatment: np.ndarray,
+    line_num: int,
+    condition: str,
+    channel: str,
+    fr: float,
+    time_window_control: list,
+    time_window_treatment: list,
+    save_path: Optional[str] = None
+) -> Tuple[plt.Figure, Dict, Dict]:
+    """
+    Create a combined scatter plot showing both control and treatment periods.
+    """
+    fig, ax = plt.subplots(figsize=(SINGLE_COLUMN_WIDTH, SINGLE_COLUMN_WIDTH))
+    
+    # Plot control (lighter, circles)
+    ax.scatter(calcium_control, eeg_control,
+               c=COLORS['control'],
+               marker=MARKERS['control'],
+               s=1,
+               alpha=0.2,
+               edgecolors='none',
+               rasterized=True,
+               label='Control')
+    
+    # Plot treatment (darker, squares)
+    ax.scatter(calcium_treatment, eeg_treatment,
+               c=COLORS['treatment'],
+               marker=MARKERS['treatment'],
+               s=1,
+               alpha=0.2,
+               edgecolors='none',
+               rasterized=True,
+               label='Treatment')
+    
+    # Compute statistics
+    stats_control = compute_statistics_robust(calcium_control, eeg_control, fr)
+    stats_treatment = compute_statistics_robust(calcium_treatment, eeg_treatment, fr)
+    
+    stats_text = ""
+    
+    # Control regression line
+    if stats_control['n'] > 2 and not np.isnan(stats_control['r']):
+        valid_ctrl = ~(np.isnan(calcium_control) | np.isnan(eeg_control))
+        calcium_ctrl_valid = calcium_control[valid_ctrl]
+        
+        p_ctrl = np.poly1d([stats_control['slope'], stats_control['intercept']])
+        x_line_ctrl = np.linspace(np.min(calcium_ctrl_valid), np.max(calcium_ctrl_valid), 100)
+        ax.plot(x_line_ctrl, p_ctrl(x_line_ctrl), 
+                color=COLORS['regression_ctrl'], 
+                linestyle='--', 
+                linewidth=1.5)
+        stats_text += f"Ctrl: r={stats_control['r']:.3f} (n_eff={stats_control['n_effective']:,})\n"
+    
+    # Treatment regression line
+    if stats_treatment['n'] > 2 and not np.isnan(stats_treatment['r']):
+        valid_treat = ~(np.isnan(calcium_treatment) | np.isnan(eeg_treatment))
+        calcium_treat_valid = calcium_treatment[valid_treat]
+        
+        p_treat = np.poly1d([stats_treatment['slope'], stats_treatment['intercept']])
+        x_line_treat = np.linspace(np.min(calcium_treat_valid), np.max(calcium_treat_valid), 100)
+        ax.plot(x_line_treat, p_treat(x_line_treat), 
+                color=COLORS['regression_treat'], 
+                linestyle='-', 
+                linewidth=1.5)
+        stats_text += f"Treat: r={stats_treatment['r']:.3f} (n_eff={stats_treatment['n_effective']:,})"
+    
+    # Add statistical annotation
+    if stats_text:
+        ax.text(0.02, 0.98, stats_text,
+               transform=ax.transAxes,
+               fontsize=FONTS['annotation'],
+               verticalalignment='top',
+               horizontalalignment='left',
+               bbox=dict(boxstyle='round',
+                        facecolor='white',
+                        edgecolor='black',
+                        linewidth=0.5,
+                        alpha=0.9))
+    
+    # Add legend
+    ax.legend(loc='lower right', fontsize=FONTS['annotation'], 
+              frameon=True, fancybox=False, shadow=False,
+              markerscale=5)
+    
+    # Formatting
+    ax.set_xlabel(f'Calcium ({UNITS["calcium"]})', fontsize=FONTS['axis_label'])
+    ax.set_ylabel(f'EEG ({UNITS["eeg"]})', fontsize=FONTS['axis_label'])
+    ax.tick_params(axis='both', which='major', labelsize=FONTS['tick_label'])
+    
+    # Remove top and right spines
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    
+    # Add subtle grid
+    ax.grid(True, alpha=0.3, linewidth=0.5, linestyle=':')
+    ax.set_axisbelow(True)
+    
+    plt.tight_layout()
+    
+    # Save figures
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        
+        tiff_path = save_path if save_path.endswith('.tiff') else save_path + '.tiff'
+        fig.savefig(tiff_path, format='tiff', bbox_inches='tight', dpi=COLOR_DPI,
+                   pil_kwargs={'compression': 'tiff_lzw'})
+        print(f"    Saved TIFF: {tiff_path}")
+        
+        eps_path = tiff_path.replace('.tiff', '.eps')
+        fig.savefig(eps_path, format='eps', bbox_inches='tight', dpi=COLOR_DPI)
+        print(f"    Saved EPS: {eps_path}")
+        
+        svg_path = tiff_path.replace('.tiff', '.svg')
+        fig.savefig(svg_path, format='svg', bbox_inches='tight', dpi=COLOR_DPI)
+        print(f"    Saved SVG: {svg_path}")
+    
+    # Print figure description
+    description = generate_combined_figure_description(
+        line_num, channel, condition, fr, 
+        stats_control, stats_treatment,
+        time_window_control, time_window_treatment, 'scatter'
+    )
+    print(description)
+    
+    plt.show()
+    plt.close(fig)
+    
+    return fig, stats_control, stats_treatment
+
+
+def create_combined_hexbin_plot(
+    calcium_control: np.ndarray,
+    eeg_control: np.ndarray,
+    calcium_treatment: np.ndarray,
+    eeg_treatment: np.ndarray,
+    line_num: int,
+    condition: str,
+    channel: str,
+    fr: float,
+    time_window_control: list,
+    time_window_treatment: list,
+    save_path: Optional[str] = None
+) -> Tuple[plt.Figure, Dict, Dict]:
+    """
+    Create a combined hexbin plot with side-by-side panels for control and treatment.
+    Uses plasma colormap.
+    """
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(SINGLE_COLUMN_WIDTH * 2, SINGLE_COLUMN_WIDTH))
+    
+    # Compute statistics
+    stats_control = compute_statistics_robust(calcium_control, eeg_control, fr)
+    stats_treatment = compute_statistics_robust(calcium_treatment, eeg_treatment, fr)
+    
+    # Filter out NaN values
+    valid_ctrl = ~(np.isnan(calcium_control) | np.isnan(eeg_control))
+    calcium_ctrl_valid = calcium_control[valid_ctrl]
+    eeg_ctrl_valid = eeg_control[valid_ctrl]
+    
+    valid_treat = ~(np.isnan(calcium_treatment) | np.isnan(eeg_treatment))
+    calcium_treat_valid = calcium_treatment[valid_treat]
+    eeg_treat_valid = eeg_treatment[valid_treat]
+    
+    # Determine shared axis limits
+    all_calcium = np.concatenate([calcium_ctrl_valid, calcium_treat_valid])
+    all_eeg = np.concatenate([eeg_ctrl_valid, eeg_treat_valid])
+    
+    x_min, x_max = np.percentile(all_calcium, [1, 99])
+    y_min, y_max = np.percentile(all_eeg, [1, 99])
+    
+    # Control hexbin
+    if len(calcium_ctrl_valid) >= 10:
+        hb1 = ax1.hexbin(calcium_ctrl_valid, eeg_ctrl_valid,
+                        gridsize=40,
+                        cmap='plasma',
+                        mincnt=1,
+                        edgecolors='none',
+                        extent=[x_min, x_max, y_min, y_max])
+        
+        # Add regression line
+        if stats_control['n'] > 2 and not np.isnan(stats_control['r']):
+            p_ctrl = np.poly1d([stats_control['slope'], stats_control['intercept']])
+            x_line = np.linspace(x_min, x_max, 100)
+            ax1.plot(x_line, p_ctrl(x_line), 'r--', linewidth=1.5)
+            ax1.text(0.02, 0.98, 
+                    f"r = {stats_control['r']:.3f}\nn_eff = {stats_control['n_effective']:,}",
+                    transform=ax1.transAxes,
+                    fontsize=FONTS['annotation'],
+                    verticalalignment='top',
+                    bbox=dict(boxstyle='round', facecolor='white', 
+                             edgecolor='black', linewidth=0.5, alpha=0.9))
+    
+    ax1.set_title('Control', fontsize=FONTS['title'], fontweight='bold')
+    ax1.set_xlabel(f'Calcium ({UNITS["calcium"]})', fontsize=FONTS['axis_label'])
+    ax1.set_ylabel(f'EEG ({UNITS["eeg"]})', fontsize=FONTS['axis_label'])
+    ax1.set_xlim([x_min, x_max])
+    ax1.set_ylim([y_min, y_max])
+    ax1.tick_params(axis='both', which='major', labelsize=FONTS['tick_label'])
+    ax1.spines['top'].set_visible(False)
+    ax1.spines['right'].set_visible(False)
+    
+    # Treatment hexbin
+    if len(calcium_treat_valid) >= 10:
+        hb2 = ax2.hexbin(calcium_treat_valid, eeg_treat_valid,
+                        gridsize=40,
+                        cmap='plasma',
+                        mincnt=1,
+                        edgecolors='none',
+                        extent=[x_min, x_max, y_min, y_max])
+        
+        # Add colorbar
+        cb = fig.colorbar(hb2, ax=ax2)
+        cb.set_label('Count', fontsize=FONTS['axis_label'])
+        cb.ax.tick_params(labelsize=FONTS['tick_label'])
+        
+        # Add regression line
+        if stats_treatment['n'] > 2 and not np.isnan(stats_treatment['r']):
+            p_treat = np.poly1d([stats_treatment['slope'], stats_treatment['intercept']])
+            x_line = np.linspace(x_min, x_max, 100)
+            ax2.plot(x_line, p_treat(x_line), 'r--', linewidth=1.5)
+            ax2.text(0.02, 0.98, 
+                    f"r = {stats_treatment['r']:.3f}\nn_eff = {stats_treatment['n_effective']:,}",
+                    transform=ax2.transAxes,
+                    fontsize=FONTS['annotation'],
+                    verticalalignment='top',
+                    bbox=dict(boxstyle='round', facecolor='white',
+                             edgecolor='black', linewidth=0.5, alpha=0.9))
+    
+    ax2.set_title('Treatment', fontsize=FONTS['title'], fontweight='bold')
+    ax2.set_xlabel(f'Calcium ({UNITS["calcium"]})', fontsize=FONTS['axis_label'])
+    ax2.set_ylabel('')
+    ax2.set_xlim([x_min, x_max])
+    ax2.set_ylim([y_min, y_max])
+    ax2.tick_params(axis='both', which='major', labelsize=FONTS['tick_label'])
+    ax2.spines['top'].set_visible(False)
+    ax2.spines['right'].set_visible(False)
+    
+    plt.tight_layout()
+    
+    # Save figures
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        
+        tiff_path = save_path if save_path.endswith('.tiff') else save_path + '.tiff'
+        fig.savefig(tiff_path, format='tiff', bbox_inches='tight', dpi=COLOR_DPI,
+                   pil_kwargs={'compression': 'tiff_lzw'})
+        print(f"    Saved TIFF: {tiff_path}")
+        
+        eps_path = tiff_path.replace('.tiff', '.eps')
+        fig.savefig(eps_path, format='eps', bbox_inches='tight', dpi=COLOR_DPI)
+        print(f"    Saved EPS: {eps_path}")
+        
+        svg_path = tiff_path.replace('.tiff', '.svg')
+        fig.savefig(svg_path, format='svg', bbox_inches='tight', dpi=COLOR_DPI)
+        print(f"    Saved SVG: {svg_path}")
+    
+    # Print figure description
+    description = generate_combined_figure_description(
+        line_num, channel, condition, fr, 
+        stats_control, stats_treatment,
+        time_window_control, time_window_treatment, 'hexbin'
+    )
+    print(description)
+    
+    plt.show()
+    plt.close(fig)
+    
+    return fig, stats_control, stats_treatment
+
+
+# ============================================================================
+# REPRODUCIBILITY LOGGING
+# ============================================================================
+
+def log_analysis_parameters(output_dir: str, line_num: int, 
+                            channel: str, norm_params: Dict) -> str:
+    """
+    Save analysis parameters for reproducibility.
+    
+    Parameters:
+    -----------
+    output_dir : str
+        Directory to save log file
+    line_num : int
+        Subject line number
+    channel : str
+        Channel name
+    norm_params : dict
+        Normalization parameters used
+        
+    Returns:
+    --------
+    log_path : str
+        Path to saved log file
+    """
+    params = {
+        'analysis_date': datetime.now().isoformat(),
+        'script_version': SCRIPT_VERSION,
+        'line_num': line_num,
+        'drug_condition': number_to_drug.get(line_num, 'unknown'),
+        'channel': channel,
+        'time_selections': selections.get(line_num, []),
+        'filter_config': FILTER_CONFIG,
+        'normalization_config': NORMALIZATION_CONFIG,
+        'normalization_params_used': norm_params,
+        'nan_handling_config': NAN_HANDLING_CONFIG,
+        'statistics_config': STATISTICS_CONFIG,
+        'software_versions': {
+            'numpy': np.__version__,
+            'scipy': scipy.__version__,
+        }
+    }
+    
+    log_path = os.path.join(output_dir, f'analysis_params_line{line_num}.json')
+    
+    # Convert numpy types to Python types for JSON serialization
+    def convert_numpy(obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, dict):
+            return {k: convert_numpy(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_numpy(i) for i in obj]
+        return obj
+    
+    params = convert_numpy(params)
+    
+    with open(log_path, 'w') as f:
+        json.dump(params, f, indent=2)
+    
+    print(f"    Saved analysis parameters: {log_path}")
+    
+    return log_path
+
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+def process_subject(
+    line_num: int,
+    channel: str,
+    output_dir: str
+) -> bool:
+    """
+    Process a single subject: load data, generate all 6 plots, save.
+    
+    Parameters:
+    -----------
+    line_num : int
+        Subject line number
+    channel : str
+        EEG channel name
+    output_dir : str
+        Output directory for figures
+        
+    Returns:
+    --------
+    success : bool
+        True if processing completed successfully
+    """
+    print(f"\n{'='*80}")
+    print(f"Processing Line {line_num}")
+    print(f"{'='*80}")
+    
+    drug = number_to_drug.get(line_num)
+    if drug is None:
+        print(f"  ERROR: Line {line_num} not found in drug mapping")
+        return False
+    
+    print(f"  Drug condition: {drug}")
+    print(f"  Channel: {CHANNEL_DESCRIPTIONS.get(channel, channel)}")
+    
+    try:
+        # Load experiment data
+        calcium_filepath = os.path.join(
+            CALCIUM_DATA_PATH, 
+            f"meanFluorescence_{line_num}.npz"
+        )
+        
+        channel_object, miniscope_data_manager, fr = load_experiment(
+            line_num, 
+            channel, 
+            calcium_signal_filepath=calcium_filepath
+        )
+        
+        # Extract signals
+        eeg_signal = channel_object.signal
+        calcium_signal = miniscope_data_manager.mean_fluorescence_dict['meanFluorescence']
+        
+        # Handle NaN values BEFORE slicing
+        print(f"  Handling NaN values...")
+        eeg_signal, eeg_valid_mask = handle_nans(eeg_signal, fr)
+        calcium_signal, calcium_valid_mask = handle_nans(calcium_signal, fr)
+        
+        # Slice into control and treatment periods
+        control_eeg, treatment_eeg = slice_signal(eeg_signal, line_num, fr)
+        control_calcium, treatment_calcium = slice_signal(calcium_signal, line_num, fr)
+        
+        # Get time windows
+        time_window_control = selections[line_num][0]
+        time_window_treatment = selections[line_num][1]
+        
+        # Apply bandpass filtering with edge trimming
+        print(f"  Applying bandpass filter ({FILTER_CONFIG['lowcut']}-{FILTER_CONFIG['highcut']} Hz) with {FILTER_CONFIG['edge_trim_seconds']}s edge trimming...")
+        filtered_control_eeg, filtered_control_calcium = filter_and_trim(
+            control_eeg, control_calcium, fr
+        )
+        filtered_treatment_eeg, filtered_treatment_calcium = filter_and_trim(
+            treatment_eeg, treatment_calcium, fr
+        )
+        
+        # Normalize signals (global z-score)
+        print(f"  Normalizing signals (method: {NORMALIZATION_CONFIG['method']}, global: {NORMALIZATION_CONFIG['global_normalization']})...")
+        (norm_control_eeg, norm_treatment_eeg, 
+         norm_control_calcium, norm_treatment_calcium, 
+         norm_params) = normalize_signals_global(
+            filtered_control_eeg, filtered_treatment_eeg,
+            filtered_control_calcium, filtered_treatment_calcium
+        )
+        
+        # Create output subdirectory for this subject
+        safe_drug = drug.replace(":", "_").replace(" ", "_").replace(".", "")
+        subject_dir = os.path.join(output_dir, f"line_{line_num}_{safe_drug}")
+        os.makedirs(subject_dir, exist_ok=True)
+        
+        # Log analysis parameters
+        log_analysis_parameters(subject_dir, line_num, channel, norm_params)
+        
+        # Generate plots
+        print(f"\n  Generating plots for Line {line_num}...")
+        
+        # 1. Control Scatter
+        print("\n  1/6: Control Scatter Plot")
+        create_scatter_plot(
+            norm_control_calcium, norm_control_eeg,
+            line_num, drug, 'Control', channel, fr, time_window_control,
+            save_path=os.path.join(subject_dir, f"scatter_control_{channel}")
+        )
+        
+        # 2. Control Hexbin
+        print("\n  2/6: Control Hexbin Plot")
+        create_hexbin_plot(
+            norm_control_calcium, norm_control_eeg,
+            line_num, drug, 'Control', channel, fr, time_window_control,
+            save_path=os.path.join(subject_dir, f"hexbin_control_{channel}")
+        )
+        
+        # 3. Treatment Scatter
+        print("\n  3/6: Treatment Scatter Plot")
+        create_scatter_plot(
+            norm_treatment_calcium, norm_treatment_eeg,
+            line_num, drug, 'Treatment', channel, fr, time_window_treatment,
+            save_path=os.path.join(subject_dir, f"scatter_treatment_{channel}")
+        )
+        
+        # 4. Treatment Hexbin
+        print("\n  4/6: Treatment Hexbin Plot")
+        create_hexbin_plot(
+            norm_treatment_calcium, norm_treatment_eeg,
+            line_num, drug, 'Treatment', channel, fr, time_window_treatment,
+            save_path=os.path.join(subject_dir, f"hexbin_treatment_{channel}")
+        )
+        
+        # 5. Combined Scatter
+        print("\n  5/6: Combined Scatter Plot")
+        create_combined_scatter_plot(
+            norm_control_calcium, norm_control_eeg,
+            norm_treatment_calcium, norm_treatment_eeg,
+            line_num, drug, channel, fr,
+            time_window_control, time_window_treatment,
+            save_path=os.path.join(subject_dir, f"scatter_combined_{channel}")
+        )
+        
+        # 6. Combined Hexbin
+        print("\n  6/6: Combined Hexbin Plot")
+        create_combined_hexbin_plot(
+            norm_control_calcium, norm_control_eeg,
+            norm_treatment_calcium, norm_treatment_eeg,
+            line_num, drug, channel, fr,
+            time_window_control, time_window_treatment,
+            save_path=os.path.join(subject_dir, f"hexbin_combined_{channel}")
+        )
+        
+        print(f"\n  Successfully completed Line {line_num}")
+        print(f"  Figures saved to: {subject_dir}")
+        
+        return True
+        
+    except Exception as e:
+        print(f"  ERROR processing line {line_num}: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def generate_all_eeg_calcium_plots(
+    channel: str = 'CBvsPCEEG',
+    line_nums: list = None,
+    output_dir: str = RESULTS_PATH
+):
+    """
+    Generate EEG vs Calcium plots for all subjects.
+    
+    Parameters:
+    -----------
+    channel : str
+        EEG channel name
+    line_nums : list, optional
+        List of subject line numbers to process (None = all)
+    output_dir : str
+        Output directory for figures
+        
+    Returns:
+    --------
+    successful : list
+        Line numbers that processed successfully
+    failed : list
+        Line numbers that failed
+    """
+    print("\n" + "="*80)
+    print("GENERATING EEG vs CALCIUM SCATTER/HEXBIN PLOTS (IMPROVED VERSION)")
+    print(f"Script version: {SCRIPT_VERSION}")
+    print(f"Channel: {CHANNEL_DESCRIPTIONS.get(channel, channel)}")
+    print(f"Output directory: {output_dir}")
+    print("="*80)
+    print("\nConfiguration:")
+    print(f"  Filter: {FILTER_CONFIG['lowcut']}-{FILTER_CONFIG['highcut']} Hz, order {FILTER_CONFIG['order']}")
+    print(f"  Edge trimming: {FILTER_CONFIG['edge_trim_seconds']} seconds")
+    print(f"  Normalization: {NORMALIZATION_CONFIG['method']}, global={NORMALIZATION_CONFIG['global_normalization']}")
+    print(f"  Autocorrelation correction: {STATISTICS_CONFIG['correct_autocorrelation']}")
+    print("="*80 + "\n")
+    
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Save global configuration
+    global_config_path = os.path.join(output_dir, 'analysis_configuration.json')
+    global_config = {
+        'script_version': SCRIPT_VERSION,
+        'analysis_date': datetime.now().isoformat(),
+        'channel': channel,
+        'filter_config': FILTER_CONFIG,
+        'normalization_config': NORMALIZATION_CONFIG,
+        'nan_handling_config': NAN_HANDLING_CONFIG,
+        'statistics_config': STATISTICS_CONFIG,
+    }
+    with open(global_config_path, 'w') as f:
+        json.dump(global_config, f, indent=2)
+    print(f"Saved global configuration: {global_config_path}\n")
+    
+    # If no specific line numbers provided, use all
+    if line_nums is None:
+        line_nums = list(selections.keys())
+    
+    print(f"Processing {len(line_nums)} subjects...")
+    
+    # Track results
+    successful = []
+    failed = []
+    
+    # Process each subject one at a time
+    for line_num in line_nums:
+        success = process_subject(line_num, channel, output_dir)
+        
+        if success:
+            successful.append(line_num)
+        else:
+            failed.append(line_num)
+    
+    # Print summary
+    print("\n" + "="*80)
+    print("PROCESSING COMPLETE")
+    print("="*80)
+    print(f"\nSuccessfully processed: {len(successful)} subjects")
+    print(f"Failed: {len(failed)} subjects")
+    
+    if failed:
+        print(f"\nFailed subjects: {failed}")
+    
+    print(f"\nFigures saved to: {output_dir}")
+    
+    return successful, failed
+
+
+if __name__ == "__main__":
+    # Run the main analysis
+    # Change channel here to analyze different electrode pairs:
+    # Options: 'CBvsPCEEG', 'PFCLFPvsCBEEG', 'PFCEEGvsCBEEG'
+    
+    successful, failed = generate_all_eeg_calcium_plots(
+        channel='PFCLFPvsCBEEG',  # ['PFCLFPvsCBEEG', 'PFCEEGvsCBEEG', 'CBvsPCEEG']
+        line_nums=None,  # None = process all subjects; or specify e.g., [46, 47, 64]
+        output_dir=RESULTS_PATH
+    )
